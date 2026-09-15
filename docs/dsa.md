@@ -1,0 +1,95 @@
+# DSA Architecture
+
+> A structure-by-structure reference for the data structures and
+> algorithms used in the Dynamic GPU Resource Allocation Engine. For
+> the full phase-by-phase narrative (including how these structures
+> plug into the Allocation/Reclamation/Balancing engines), see
+> [`architecture.md`](architecture.md). All implementations live under
+> [`engine/dsa/`](../engine/dsa/), each with dedicated unit tests under
+> [`tests/dsa/`](../tests/dsa/).
+
+Every structure below exists because a specific piece of the
+scheduler needs it — not to check a syllabus box. Two are used exactly
+as the generic textbook structure (`HashMap`, `LinkedList` via
+`GPUPool`); the others are generic building blocks with a thin,
+project-specific wrapper on top so the underlying DSA component stays
+reusable while the wrapper carries the project's vocabulary.
+
+| Data Structure | File(s) | Purpose in this project | Complexity |
+|---|---|---|---|
+| **Linked List** | `dsa/linked_list.py` (generic) → `dsa/gpu_pool.py` (`GPUPool`) | The company's GPU inventory. A linked list gives O(1) insertion/removal as GPUs are dynamically added to or removed from the pool — no shifting elements the way a fixed array would need. | append/prepend O(1); find/remove O(n); size O(1) |
+| **Min-Heap** | `dsa/min_heap.py` (generic) → `dsa/gpu_utilization_heap.py` (`GPUUtilizationHeap`) | Efficiently answers "which GPU is least utilized right now?" — used by the Load-Balancing Router to pick the least-utilized *available* GPU. Never decides whether a GPU should be reclaimed. | insert O(log n); extract-min O(log n); peek O(1); rebuild (after external mutation) O(n) |
+| **Max-Heap** | `dsa/max_heap.py` (generic) | The ordering engine `PriorityQueue` is built on. Kept separate and comparator-driven so no priority *rule* is baked into the heap itself. | insert O(log n); extract-max O(log n); peek O(1); rebuild O(n) |
+| **Priority Queue** | `dsa/priority_queue.py` (`PriorityQueue`, wraps `MaxHeap`) | Manages waiting jobs by whatever comparator the scheduler supplies (the allocation-score formula) — insertion-order tie-breaking for equal priorities. | insert O(log n); pop-best O(log n); peek O(1) |
+| **HashMap** | `dsa/hashmap.py` (generic) → `dsa/user_gpu_index.py` (`UserGPUIndex`) | Fast user → currently-assigned-GPU(s) lookup, built from `GPUAssignment` records; a real bucket array with separate-chaining collision handling, doubling past a 0.75 load factor. | put/get/remove/contains O(1) average (amortized resize); O(n) worst case |
+| **Queue** | `dsa/queue.py` (generic) → `dsa/waiting_job_queue.py` (`WaitingJobQueue`) | Preserves arrival order for waiting jobs, backing the FCFS path when the 20%-similarity rule decides two jobs should be served by arrival order instead of by score. | enqueue/dequeue/peek O(1) |
+| **Stack** | `dsa/stack.py` (generic) → `dsa/reclaim_history.py` (`ReclaimHistory`) | Records reclaim `Event`s so the most recent reclaim is always what a rollback would undo first. | push/pop/peek O(1) |
+| **Sliding Window** | `dsa/sliding_window.py` (`UtilizationSlidingWindow`, built on `Queue`) | Keeps only the `UtilizationObservation`s inside a trailing time window, so the reclamation engine can tell a *sustained* low reading apart from a brief dip, without rescanning a GPU's entire history each time. | add O(1) + amortized O(1) eviction per observation; window query O(n) in current window; span O(1) |
+
+## Two extra project concepts, not separate data structures
+
+- **Weighted scoring** — the allocation-score formula
+  (`engine/allocation/scoring.py`) combines a normalized priority
+  component and a normalized job-size component (60/40 by default) to
+  rank waiting jobs. Not a data structure itself, but the comparator
+  the Priority Queue / score-based selection path is built around.
+- **SJF (job-size-based scheduling)** — the "size" half of the
+  allocation score, plus the 20% job-size-similarity check
+  (`engine/allocation/similarity.py`) that decides whether a round of
+  competing jobs is served FCFS or by score at all.
+- **Load balancing** — `engine/balancing/router.py` is the algorithm
+  that consumes the Min-Heap above (plus a HashMap lookup and the
+  Linked-List-backed GPU pool) to route new work to the least-utilized
+  *available* GPU, never touching a GPU that is already legitimately
+  assigned regardless of how idle it looks.
+
+## Why a Max-Heap *and* a Priority Queue, when they sound like the same thing?
+
+They're not duplicated — they're layered. `MaxHeap[T]` is the raw,
+comparator-free array-heap mechanism (sift-up/sift-down).
+`PriorityQueue[T]` is that mechanism wrapped with a caller-supplied
+`key_fn` and FIFO tie-breaking. Building the Priority Queue *on top
+of* the Max-Heap, rather than writing two independent heaps, is what
+keeps the Max-Heap itself free of any hardcoded priority rule.
+
+## Why the GPU pool is a real linked list and not `list.append`
+
+Python's `list` already gives amortized O(1) append, so the
+difference isn't raw speed — it's that a `list` doesn't teach or
+demonstrate anything about node-based structures, and the project
+explicitly calls for a linked list here. `LinkedList` is implemented
+with actual node objects and head/tail pointers; `GPUPool` is the
+thin, GPU-flavoured API around it.
+
+## Why the HashMap is hand-built instead of `dict`
+
+Same reasoning: `dict` would work, but wrapping it teaches nothing.
+`HashMap` is a real bucket array with separate-chaining collision
+handling and doubles its capacity past a 0.75 load factor, same as
+production hash tables do it.
+
+## Why `Queue` uses head/tail node pointers but `Stack` uses a plain list
+
+A queue must add at one end and remove from the other; `list.pop(0)`
+for that would be O(n) because every remaining element shifts down, so
+`Queue` needs real linked nodes for O(1) on both ends. A stack only
+ever touches one end, which is exactly what `list.append`/`list.pop()`
+(no index argument) already do in O(1) — adding node-linking there
+would add complexity without changing the complexity class.
+
+## Where each structure is actually wired in
+
+| Structure | Consumed by |
+|---|---|
+| `GPUPool` (linked list) | `AllocationEngine` — the full GPU inventory (`add_gpu`/`remove_gpu`/lookup); `LoadBalancingRouter` draws its candidate pool from the same object, never a second one. |
+| `GPUUtilizationHeap` (min-heap) | `AllocationEngine._pop_available_gpu` — holds only currently-available GPUs. `LoadBalancingRouter` builds an equivalent `MinHeap` over routable candidates for `route_job`. |
+| `PriorityQueue` / `MaxHeap` | Available for score-ordered selection; `main.py`'s Phase 2 demo exercises it directly. `AllocationEngine.select_next_job` itself sorts the small, per-decision candidate list directly, since it's at most "however many jobs are waiting" — see `architecture.md`'s Allocation Engine section for why that isn't "bypassing the DSA layer". |
+| `WaitingJobQueue` (Queue) | `AllocationEngine` — the actual storage for every waiting job in arrival order; the FCFS tie-break path reads from it. |
+| `UserGPUIndex` (HashMap) | Updated on every assignment; `get_gpus_for_user` is an O(1) lookup of what a user currently holds. |
+| `ReclaimHistory` (Stack) | `ReclamationEngine.last_reclaim()` / `undo_last_reclaim()` — most-recent-reclaim-first. |
+| `UtilizationSlidingWindow` | One per watched GPU, sized to the larger reclamation tier's duration; `ReclamationEngine._detect_tier` reads it (never the GPU's full lifetime history) to run the sustained-breach check. |
+
+Every structure is tested twice over: once directly (`tests/dsa/`),
+proving the structure's own contract, and once indirectly, through the
+engine/integration tests, proving it is actually wired into the
+decision it claims to serve.

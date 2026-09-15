@@ -1,0 +1,21 @@
+# Dynamic GPU Resource Allocation Engine — backend dependencies
+#
+# Install with: pip install -r requirements.txt
+#
+# `engine/` itself (the scheduler core) has zero third-party
+# dependencies — only the API adapter (api/) and the test suite need
+# the packages below. Versions are the ones this project is developed
+# and tested against; newer minor/patch versions are expected to work.
+
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+httpx==0.28.0
+websockets==13.1
+pytest==8.3.4
+
+# Optional — only needed to exercise real NVIDIA hardware monitoring
+# via NVML (engine/hardware/nvml_monitor.py). Not required to run the
+# engine, the API, the frontend, or the test suite; the import is
+# guarded so its absence never breaks anything else. Uncomment if you
+# have an NVIDIA GPU + driver and want to enable real monitoring:
+# pynvml
