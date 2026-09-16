@@ -15,6 +15,104 @@ as the generic textbook structure (`HashMap`, `LinkedList` via
 project-specific wrapper on top so the underlying DSA component stays
 reusable while the wrapper carries the project's vocabulary.
 
+## The Dynamic GPU Pool
+
+```
+Company GPU Pool
+       ↓
+Dynamic GPU Pool        (engine.dsa.gpu_pool.GPUPool)
+       ↓
+Linked List             (engine.dsa.linked_list.LinkedList[GPU])
+       ↓
+GPU Nodes                (one node per GPU object)
+       ↓
+Scheduler / Allocation Engine
+```
+
+**Why a Linked List?**
+
+- **Dynamic insertion/deletion of GPU nodes** — GPUs join and leave
+  the company pool at arbitrary times (a new card provisioned, one
+  decommissioned, an admin's maintenance action); a linked list's
+  O(1) append/prepend and node-level removal fit that directly.
+- **No need for contiguous storage** — unlike a fixed-size array, the
+  pool never needs to be pre-sized or reallocated/shifted as GPUs are
+  added or removed.
+- **Suitable for a dynamically changing resource pool** — the pool's
+  size is never assumed anywhere; `GPUPool` only ever reports
+  `size()`/`is_empty()` from what is actually in the list right now.
+
+**Complexity** (from `LinkedList`, unchanged by the `GPUPool` wrapper):
+
+| Operation | Complexity | Why |
+|---|---|---|
+| `add_gpu` (append) | O(1) | Tail pointer — no traversal needed. |
+| `remove_gpu` (by id) | O(n) | Must scan to find the matching node — the documented cost of a singly linked list without a reverse index. |
+| `get_gpu` (find, by id) | O(n) | Same reason as removal. |
+| `all_gpus` / iteration | O(n) total | One pass over every node. |
+| `size` / `is_empty` | O(1) | Maintained by a counter, never counted on demand. |
+
+**Determining available vs. allocated GPUs** is deliberately *not* a
+second definition invented inside the pool — it composes the pool's
+traversal with the project's one existing availability predicate,
+`engine.balancing.availability.is_gpu_available` (`not gpu.is_assigned
+and gpu.status == GPUStatus.IDLE`):
+
+```python
+available = [g for g in pool if is_gpu_available(g)]   # O(n)
+allocated = [g for g in pool if g.is_assigned]          # O(n)
+```
+
+Keeping this logic in `balancing/`, not in `dsa/gpu_pool.py`, matters:
+`dsa/` is the project's lowest layer (it depends only on `engine.models`),
+and `balancing/` depends on `dsa/` — importing `balancing` back into
+`dsa` would invert that dependency and risk a circular import. The
+pool stays a pure data-structure wrapper; availability stays a policy
+decision made in exactly one place, as documented in
+`engine/balancing/availability.py`.
+
+**GPU statuses and the pool.** The pool holds `GPU` objects exactly as
+`engine.models.enums.GPUStatus` defines them — it introduces no
+competing status vocabulary. Mapped onto this task's plain-English
+terms:
+
+| Plain-English term | Actual `GPUStatus` |
+|---|---|
+| AVAILABLE | `IDLE` |
+| ALLOCATED | `ACTIVE` |
+| IDLE_WARNING | `IDLE_WARNING` (unchanged) |
+| RECLAIMING | `RECLAIMING` (unchanged) |
+| MAINTENANCE | `MAINTENANCE` (unchanged) |
+| UNAVAILABLE | `UNAVAILABLE` (unchanged) |
+
+No new statuses were needed or added — the existing enum already
+covers every state this task calls for, including the two that must
+never be allocated (`MAINTENANCE`, an admin's deliberate choice via
+`Scheduler.set_gpu_maintenance`; `UNAVAILABLE`, the hardware layer
+reporting a GPU as gone via `Scheduler.handle_gpu_failure`). Both are
+excluded from `is_gpu_available` simply by not being `IDLE` — no
+special-case branching was required.
+
+**GPU lifecycle**, exactly as the existing engines already drive it:
+
+```
+AVAILABLE (IDLE)
+   ↓  AllocationEngine commits a job
+ALLOCATED (ACTIVE)
+   ↓  Scheduler.complete_job / a reclaim resolves
+RELEASED (GPU.assigned_user_id/job_id -> None, status -> IDLE)
+   ↓
+AVAILABLE (IDLE) again
+```
+
+**Arbitrary pool size.** Nothing in `GPUPool`, `AllocationEngine`, or
+`Scheduler` reads or branches on a GPU count. The current
+demonstration initializes 5 logical GPUs (`GPU-1`..`GPU-5`); the same
+code path is exercised at 1, 10, 50, and 100 GPUs in
+`tests/dsa/test_gpu_pool.py` with no engine changes of any kind — the
+number of GPUs is purely a property of how many `GPU` objects a
+caller happens to `add_gpu()`.
+
 | Data Structure | File(s) | Purpose in this project | Complexity |
 |---|---|---|---|
 | **Linked List** | `dsa/linked_list.py` (generic) → `dsa/gpu_pool.py` (`GPUPool`) | The company's GPU inventory. A linked list gives O(1) insertion/removal as GPUs are dynamically added to or removed from the pool — no shifting elements the way a fixed array would need. | append/prepend O(1); find/remove O(n); size O(1) |
