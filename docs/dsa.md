@@ -124,6 +124,100 @@ caller happens to `add_gpu()`.
 | **Stack** | `dsa/stack.py` (generic) → `dsa/reclaim_history.py` (`ReclaimHistory`) | Records reclaim `Event`s so the most recent reclaim is always what a rollback would undo first. | push/pop/peek O(1) |
 | **Sliding Window** | `dsa/sliding_window.py` (`UtilizationSlidingWindow`, built on `Queue`) | Keeps only the `UtilizationObservation`s inside a trailing time window, so the reclamation engine can tell a *sustained* low reading apart from a brief dip, without rescanning a GPU's entire history each time. | add O(1) + amortized O(1) eviction per observation; window query O(n) in current window; span O(1) |
 
+## GPU Utilization Tracking (the Min-Heap)
+
+```
+NVML / nvidia-smi
+        ↓
+Hardware Monitor          (engine.hardware.monitor.GPUMonitor - one interface)
+        ↓
+MonitorPoller              (engine.hardware.poller - feeds readings into the scheduler)
+        ↓
+SchedulerState GPU utilization   (GPU.utilization_percent - the one source of truth)
+        ↓
+GPU Utilization Min-Heap    (engine.dsa.gpu_utilization_heap.GPUUtilizationHeap / a router-built MinHeap)
+        ↓
+Scheduler / Allocation Engine
+```
+
+For simulation, the exact same pipeline runs on a mock source instead
+of real hardware — nothing below `MonitorPoller` knows or cares which
+one fed it:
+
+```
+Mock Monitor (SimulatorGPUMonitor)
+        ↓
+MonitorPoller
+        ↓
+same SchedulerState
+        ↓
+same Min-Heap
+        ↓
+same Scheduler
+```
+
+**Why a Min-Heap here.** The engine frequently needs to answer "which
+suitable GPU currently has the lowest utilization?" — for routing new
+work, that question would otherwise mean scanning every GPU in the
+pool on every decision. A Min-Heap answers it in O(log n) per
+insertion and O(1) to peek, instead of an O(n) scan repeated on every
+allocation.
+
+**Where the Min-Heap is actually used** — two real sites, not one
+generic index reused blindly:
+
+1. **`LoadBalancingRouter.route_job`** (`engine/balancing/router.py`)
+   — the live path every real allocation actually goes through
+   (`Scheduler.try_allocate_all`). It builds a fresh `MinHeap[GPU]`,
+   keyed on `(utilization_percent, gpu_id)`, from whatever is
+   currently available *at the moment of the decision* — never a
+   heap that could hold a stale reading, because it is rebuilt from
+   `SchedulerState` on every single call. The `gpu_id` tie-break makes
+   ties deterministic rather than dependent on dict/insertion order.
+2. **`AllocationEngine`'s `GPUUtilizationHeap`** (`_available_gpus`) —
+   a *persistent* heap backing the engine's own standalone
+   `allocate_next`/`allocate_all` (used directly by `main.py`'s demo
+   and by allocation-only unit tests, not by `Scheduler`'s own live
+   path). Because it is persistent, a GPU's utilization can change
+   while it is sitting in the heap; `GPUUtilizationHeap.refresh()`
+   (built on `MinHeap.rebuild`, O(n)) is the project's chosen update
+   mechanism for that — verified directly in
+   `tests/dsa/test_gpu_utilization_heap.py`.
+
+**Utilization updates and consistency.** `GPU.utilization_percent`
+lives on the one `GPU` object `SchedulerState` owns; every heap above
+holds *references* to that same object, never a copy. This project
+deliberately does not maintain a second, independent utilization
+value inside either heap — an update always means either (a) rebuild
+the heap fresh from `SchedulerState` (the router's approach, and the
+one used for every live allocation), or (b) call `refresh()` on a
+persistent heap after a referenced GPU's key changed (the
+`AllocationEngine`/`main.py`-demo approach). Both keep `SchedulerState`
+as the single authoritative source; the heap is always just an
+efficient index over it, never a competing truth.
+
+**Available-GPU-count consistency.** `AllocationEngine.
+available_gpu_count()` deliberately does **not** read
+`self._available_gpus.size()` — that heap only ever grows relative to
+GPUs actually committed through `Scheduler.try_allocate_all` (which
+never pops from it), so trusting it would silently drift from the
+truth the moment any GPU is committed through the live path (this was
+a real issue an earlier validation pass found and fixed). It instead
+counts directly over `SchedulerState.gpus` using the one
+`is_gpu_available` predicate — the same guarantee
+`test_available_gpu_count_matches_state_even_when_the_legacy_heap_has_drifted`
+locks down by deliberately manufacturing that drift and asserting the
+count still matches ground truth.
+
+**Complexity**, unchanged from `MinHeap`'s own documented cost:
+
+| Operation | Complexity |
+|---|---|
+| `peek_least_utilized` / `peek_min` | O(1) |
+| `insert_gpu` / `insert` | O(log n) |
+| `extract_least_utilized` / `extract_min` | O(log n) |
+| `refresh` / `rebuild` (after an already-inserted GPU's utilization changed) | O(n) |
+
 ## Two extra project concepts, not separate data structures
 
 - **Weighted scoring** — the allocation-score formula
