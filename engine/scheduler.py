@@ -457,6 +457,18 @@ class Scheduler:
             gpu.status = GPUStatus.IDLE
             if user is not None and gpu.gpu_id in user.assigned_gpu_ids:
                 user.assigned_gpu_ids.remove(gpu.gpu_id)
+            # Day 4 (user/job management audit): every other release
+            # path (`force_reclaim`, `handle_gpu_failure`,
+            # `ReclamationEngine._reclaim`) already calls this to keep
+            # the HashMap-backed `UserGPUIndex` in sync - a normal
+            # completion was the one release path that didn't, so
+            # `AllocationEngine.get_gpus_for_user` kept reporting a GPU
+            # the user no longer held (SchedulerState/User.
+            # assigned_gpu_ids were already correct; only this index
+            # was stale). The index is never a second source of truth,
+            # only an efficient view over the one real state - this
+            # keeps it that way for every release path, not just some.
+            self.allocation_engine.release_user_gpu(job.user_id, gpu_id)
 
         if user is not None and job_id in user.running_job_ids:
             user.running_job_ids.remove(job_id)

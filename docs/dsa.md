@@ -218,6 +218,100 @@ count still matches ground truth.
 | `extract_least_utilized` / `extract_min` | O(log n) |
 | `refresh` / `rebuild` (after an already-inserted GPU's utilization changed) | O(n) |
 
+## User/Job Management: HashMap Lookup & Waiting Queue
+
+**Which structure is authoritative, and which are indexes.**
+`SchedulerState` (`engine/models/scheduler_state.py`) is the one
+source of truth: `gpus`/`users`/`jobs` are plain Python `dict`s keyed
+by id. A `dict` *is* a hash map — this project deliberately does not
+reimplement a hand-built `HashMap` here a second time (see "Why the
+HashMap is hand-built instead of `dict`" below for where a hand-built
+one *is* worth it, and why); `SchedulerState.get_user`/`get_job`/
+`get_gpu` are already the O(1)-average `user_id -> User` /
+`job_id -> Job` / `gpu_id -> GPU` lookups this task asks for, and they
+are what every engine (`AllocationEngine`, `ReclamationEngine`,
+`LoadBalancingRouter`, `Scheduler`) already reads from — not a second,
+competing lookup path built for this task.
+
+The one place a genuinely different-shaped index earns a hand-built
+`HashMap` is **`UserGPUIndex`** (`dsa/user_gpu_index.py`) — a
+`user_id -> List[gpu_id]` *reverse* index (one user can hold many
+GPUs), built from `GPUAssignment` records and kept live by
+`AllocationEngine._user_index`. It already participates in the real
+scheduler path (`AllocationEngine.get_gpus_for_user`, `release_user_gpu`)
+rather than existing only for demonstration.
+
+**GPU -> Job -> User (the reverse chain).** `SchedulerState.
+get_job_on_gpu(gpu_id)` (one dict lookup by `gpu.assigned_job_id`,
+already O(1)) chained with `get_user(job.user_id)` (another O(1) dict
+lookup) answers "GPU-2 -> Job 101 -> User A" in two O(1) hops, with no
+new structure needed.
+
+**User -> Job(s).** Two existing, already-used equivalents, for two
+different questions: `User.running_job_ids` (O(1) list read) for
+*currently running* jobs, and filtering `SchedulerState.jobs` by
+`job.user_id` (O(n) over all jobs) for *every* job regardless of
+status — the exact pattern `api/serializers.py::serialize_portal_state`
+already uses to build a user's "my jobs" view. Job/user counts are
+small at this project's scale (the same reasoning already documented
+for several O(n) operations elsewhere in this file), so this was not
+worth a dedicated reverse index.
+
+**The waiting queue.** `WaitingJobQueue` (`dsa/waiting_job_queue.py`,
+wrapping the generic `Queue`) is the actual FIFO storage
+`AllocationEngine` enqueues every waiting job into and removes them
+from — not a parallel structure kept in sync by hand. A job that
+cannot yet be fully satisfied (a multi-GPU request short of
+`gpu_count`) stays as **one** queue entry, never one per missing GPU —
+`Job.gpu_count` (requested), `len(Job.assigned_gpu_ids)` (allocated),
+and `Job.gpus_still_needed` (remaining) already represent that state
+cleanly on the job itself; the queue only ever holds *jobs*, never a
+per-GPU placeholder.
+
+**Job lifecycle**, using the existing `JobStatus` enum only — no new
+states were added:
+
+```
+(REQUEST event logged) -> WAITING -> RUNNING -> COMPLETED
+                              |          |
+                              v          v
+                          CANCELLED   RECLAIMED
+```
+
+"REQUESTED" (from the task's own wording) is not a persisted
+`JobStatus` — it is the `EventType.REQUEST` event `Scheduler.submit_job`
+already logs at the moment of submission, immediately followed by the
+job's initial `JobStatus.WAITING`. Priority preemption and a GPU
+holding only *some* of a multi-GPU job's GPUs failing both still end
+at `RECLAIMED`/`WAITING` respectively through the project's one real
+reclaim path (`ReclamationEngine._reclaim`/`Scheduler.handle_gpu_failure`)
+— distinguished by the *event*'s type/metadata
+(`PRIORITY_PREEMPTION`/`HARDWARE_FAILURE`), never by inventing a
+`PREEMPTED` or `FAILED` job status the enum's own documented design
+already rejected ("a separate interrupted vs. reclaimed state was
+considered and dropped").
+
+**A real consistency bug found and fixed while verifying this.**
+`Scheduler.complete_job` released a finished job's GPU from `GPU`/
+`User` correctly, but — unlike `force_reclaim`, `handle_gpu_failure`,
+and `ReclamationEngine._reclaim`, which all call
+`AllocationEngine.release_user_gpu` — it never told the HashMap-backed
+`UserGPUIndex`. `AllocationEngine.get_gpus_for_user` would then keep
+reporting a GPU a user no longer held, after an ordinary job
+completion specifically. Fixed by adding the same `release_user_gpu`
+call every other release path already makes — one line, no policy
+change; regression-tested in
+`tests/test_user_job_management.py::test_no_dangling_userindex_entry_after_normal_completion`.
+
+**Complexity:**
+
+| Structure | Operation | Complexity |
+|---|---|---|
+| `SchedulerState` dict lookups | get by id | O(1) average |
+| `HashMap` / `UserGPUIndex` | get/put/remove | O(1) average (amortized resize); O(n) worst case |
+| `Queue` / `WaitingJobQueue` | enqueue/dequeue/peek | O(1) |
+| User -> all jobs (status-agnostic) | filter `SchedulerState.jobs` | O(n) in total job count |
+
 ## Two extra project concepts, not separate data structures
 
 - **Weighted scoring** — the allocation-score formula
