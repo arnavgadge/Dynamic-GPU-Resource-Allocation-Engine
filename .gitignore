@@ -33,3 +33,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Generated report documents (kept locally, not tracked in git)
+final_report_dsa.docx
+gpu_scheduler_full_report.docx
