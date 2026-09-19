@@ -190,7 +190,16 @@ class AllocationEngine:
         having already set `job.status = JobStatus.WAITING` and
         cleared whatever GPUs it no longer holds; this only makes sure
         `select_next_job` can actually see it again.
+
+        Idempotent (Day 5): a partially-allocated multi-GPU job is
+        already WAITING *and* still in the FIFO; if it then loses its
+        last held GPU, the caller requeues it - which used to enqueue
+        a second copy, so the same job competed against itself and
+        `waiting_job_ids()` reported it twice. A job already present
+        is simply left where it is (its original arrival position).
         """
+        if any(queued.job_id == job.job_id for queued in self._waiting_jobs.to_list()):
+            return
         self._waiting_jobs.enqueue_job(job)
 
     def remove_waiting_job(self, job_id: str) -> None:
@@ -305,6 +314,8 @@ class AllocationEngine:
             base_score=breakdown.base_score if breakdown is not None else None,
             aging_component=breakdown.aging_component if breakdown is not None else None,
             waiting_minutes=breakdown.waiting_minutes if breakdown is not None else None,
+            priority_component=breakdown.priority_component if breakdown is not None else None,
+            size_component=breakdown.size_component if breakdown is not None else None,
         )
 
     def calculate_score(self, job: Job, candidates: List[Job], now: Optional[datetime] = None) -> float:

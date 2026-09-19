@@ -48,6 +48,14 @@ class CandidateInfo:
     aging_component: Optional[float] = None
     waiting_minutes: Optional[float] = None
 
+    #: The two normalized terms behind `base_score` (Day 5) - so a
+    #: candidate's full explanation (priority component, size
+    #: component, aging, final score) is available on the decision
+    #: itself, not only via the separate `ScoreBreakdown`. `None`
+    #: whenever `score` is, for the same reason.
+    priority_component: Optional[float] = None
+    size_component: Optional[float] = None
+
 
 @dataclass
 class AllocationDecision:

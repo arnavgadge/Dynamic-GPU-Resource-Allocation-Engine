@@ -312,6 +312,77 @@ change; regression-tested in
 | `Queue` / `WaitingJobQueue` | enqueue/dequeue/peek | O(1) |
 | User -> all jobs (status-agnostic) | filter `SchedulerState.jobs` | O(n) in total job count |
 
+## Allocation Engine & Weighted Scoring
+
+**Flow** (all backend; `Scheduler.try_allocate_all` is the one place it
+is sequenced, and it makes no decision itself):
+
+```
+Waiting Jobs (WaitingJobQueue, FIFO)
+     ↓
+Critical-tier gate  →  20% size-similarity check  →  FCFS  or  score-based
+     ↓ (score-based)
+Calculate Scores        engine/allocation/scoring.py
+     ↓
+Priority Queue / Max-Heap    (PriorityQueue over MaxHeap)
+     ↓
+Highest-scoring job (ties: earliest submitted_at)
+     ↓
+GPU Pool + Min-Heap     LoadBalancingRouter: available GPUs only, least utilized first
+     ↓
+finalize_assignment     GPU/User/Job/GPUAssignment/UserGPUIndex updated together
+     ↓
+ALLOC + STATUS events   (and the decision trace)
+```
+
+**Formula.** `Allocation Score = 0.6 × priority component + 0.4 × size
+component + aging`. Each term is its own function in `scoring.py` —
+`calculate_priority_component` (fixed 0..1 scale from the `Priority`
+enum), `calculate_size_component` (min-max inverse *among the current
+candidates*, never `1/size`), `calculate_aging_component` (0.01 per
+minute waited, capped at 1.1) — combined only by
+`calculate_allocation_score`, which returns a `ScoreBreakdown`. The
+weights and aging constants live once, in `allocation/config.py`.
+`CandidateInfo` (the per-candidate record on every `AllocationDecision`)
+now carries the full explanation: priority, size, waiting time,
+priority component, size component, aging contribution, base and
+final score.
+
+**Priority Queue integration.** The score-based branch inserts the
+candidates into a `PriorityQueue` keyed on `(final_score,
+-submitted_at)` and pops the winner — higher score first, equal scores
+resolved deterministically by earliest submission. The candidate set
+is rebuilt from the live waiting queue on every decision, so the
+queue can never disagree with `SchedulerState` when a job enters,
+leaves, is cancelled, is allocated, is requeued, or changes priority
+(`Job.priority` is read at decision time; there is no stale
+priority snapshot to re-insert). Selection also filters on
+`JobStatus.WAITING`, so a cancelled job left in the FIFO is never
+offered.
+
+**Multi-GPU.** A job is one queue entry whose `gpu_count` /
+`len(assigned_gpu_ids)` / `gpus_still_needed` track the request. Each
+pass commits one GPU at a time under the same policy; the job becomes
+`RUNNING` only when fully allocated (requested 4 → 2/2 → 3/1 → 4/0).
+`requeue_job` is idempotent — a partially-allocated job that loses its
+last GPU is not queued twice (a duplicate-entry bug found and fixed
+on Day 5).
+
+**Complexity** (n = candidates in the decision, g = available GPUs):
+
+| Step | Structure | Cost |
+|---|---|---|
+| Insert scored candidates | Max-Heap / Priority Queue | O(log n) each |
+| Highest-scoring job | Max-Heap peek / pop | O(1) peek, O(log n) pop |
+| Remove a waiting job | FIFO rebuild (`_remove_from_waiting_queue`) | O(w), w = jobs waiting |
+| Least-utilized available GPU | Min-Heap (router) | O(log g) per insert/extract, O(1) peek |
+| id → User / Job / GPU | `SchedulerState` dicts (hash maps) | O(1) average |
+| Whole decision | select + route + commit | O(n log n + g log g) |
+
+The three structures cooperate in one path: the Priority Queue picks
+*which job*, the Min-Heap picks *which GPU*, and the hash maps resolve
+the ids both decisions touch without scanning.
+
 ## Two extra project concepts, not separate data structures
 
 - **Weighted scoring** — the allocation-score formula
