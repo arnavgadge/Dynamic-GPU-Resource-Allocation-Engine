@@ -39,14 +39,14 @@ implements GPU reclamation, load balancing, or leases.
 """
 
 import itertools
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
 from engine.allocation.config import JOB_SIZE_SIMILARITY_THRESHOLD
 from engine.allocation.decision import AllocationDecision, AllocationPolicy, CandidateInfo
 from engine.allocation.scoring import ScoreBreakdown, allocation_score, calculate_allocation_score
 from engine.balancing.availability import is_gpu_available
-from engine.allocation.similarity import relative_size_spread
+from engine.allocation.similarity import are_job_sizes_similar, relative_size_spread
 from engine.dsa.gpu_pool import GPUPool
 from engine.dsa.gpu_utilization_heap import GPUUtilizationHeap
 from engine.dsa.priority_queue import PriorityQueue
@@ -240,17 +240,21 @@ class AllocationEngine:
         if len(pool) == 1:
             winner = pool[0]
             reason = f"{tier_note}; only one eligible candidate ({winner.job_id}) - trivially FCFS"
-            return winner, AllocationPolicy.FCFS, reason, [self._candidate_info(winner, breakdown=None)]
+            return winner, AllocationPolicy.FCFS, reason, [
+                self._candidate_info(winner, breakdown=None, arrival_position=1, now=now)
+            ]
 
         sizes = [job.estimated_size_minutes for job in pool]
         spread = relative_size_spread(sizes)
         threshold_pct = f"{JOB_SIZE_SIMILARITY_THRESHOLD:.0%}"
 
-        if spread <= JOB_SIZE_SIMILARITY_THRESHOLD:
-            return self._select_fcfs(pool, tier_note, spread, threshold_pct)
+        if are_job_sizes_similar(pool):
+            return self._select_fcfs(pool, tier_note, spread, threshold_pct, now)
         return self._select_score_based(pool, tier_note, spread, threshold_pct, now)
 
-    def _select_fcfs(self, pool: List[Job], tier_note: str, spread: float, threshold_pct: str) -> _Selection:
+    def _select_fcfs(
+        self, pool: List[Job], tier_note: str, spread: float, threshold_pct: str, now: Optional[datetime] = None,
+    ) -> _Selection:
         # The waiting queue's FIFO order matches submission order in
         # the normal (real-time) case, but the winner is picked from
         # `Job.submitted_at` directly rather than trusting queue
@@ -263,7 +267,11 @@ class AllocationEngine:
             f"{tier_note}; job sizes within {threshold_pct} of each other "
             f"(spread={spread:.1%}) -> FCFS; {winner.job_id} has waited longest"
         )
-        candidates = [self._candidate_info(job, breakdown=None) for job in pool]
+        positions = self._arrival_positions(pool)
+        candidates = [
+            self._candidate_info(job, breakdown=None, arrival_position=positions[job.job_id], now=now)
+            for job in pool
+        ]
         return winner, AllocationPolicy.FCFS, reason, candidates
 
     def _select_score_based(
@@ -300,22 +308,46 @@ class AllocationEngine:
             f"{winner.job_id} scored highest ({winner_breakdown.final_score:.3f}"
             f"{f', incl. +{winner_breakdown.aging_component:.3f} aging' if winner_breakdown.aging_component > 0 else ''})"
         )
-        candidates = [self._candidate_info(job, breakdown=breakdowns[job.job_id]) for job in pool]
+        positions = self._arrival_positions(pool)
+        candidates = [
+            self._candidate_info(
+                job, breakdown=breakdowns[job.job_id], arrival_position=positions[job.job_id], now=now,
+            )
+            for job in pool
+        ]
         return winner, AllocationPolicy.SCORE_BASED, reason, candidates
 
-    def _candidate_info(self, job: Job, breakdown: Optional[ScoreBreakdown]) -> CandidateInfo:
+    @staticmethod
+    def _arrival_positions(pool: List[Job]) -> dict:
+        """1-based arrival rank per job id, by `submitted_at`; ties
+        keep FIFO queue order (`sorted` is stable) - the same order
+        `_select_fcfs`'s `min` resolves ties in."""
+        ordered = sorted(pool, key=lambda job: job.submitted_at)
+        return {job.job_id: rank for rank, job in enumerate(ordered, start=1)}
+
+    def _candidate_info(
+        self, job: Job, breakdown: Optional[ScoreBreakdown], arrival_position: Optional[int] = None,
+        now: Optional[datetime] = None,
+    ) -> CandidateInfo:
+        # `Job.waiting_time` measures against the *wall clock* while a
+        # job hasn't started, which is wrong under a simulated clock
+        # (a 2026-01-01 simulation showed "waited 261 days"). When the
+        # caller supplies the decision's own `now`, report the wait
+        # against that - the same reference the aging term already uses.
+        waiting_time = max(now - job.submitted_at, timedelta(0)) if now is not None else job.waiting_time
         return CandidateInfo(
             job_id=job.job_id,
             user_id=job.user_id,
             priority=job.priority,
             size_minutes=job.estimated_size_minutes,
-            waiting_time=job.waiting_time,
+            waiting_time=waiting_time,
             score=breakdown.final_score if breakdown is not None else None,
             base_score=breakdown.base_score if breakdown is not None else None,
             aging_component=breakdown.aging_component if breakdown is not None else None,
             waiting_minutes=breakdown.waiting_minutes if breakdown is not None else None,
             priority_component=breakdown.priority_component if breakdown is not None else None,
             size_component=breakdown.size_component if breakdown is not None else None,
+            arrival_position=arrival_position,
         )
 
     def calculate_score(self, job: Job, candidates: List[Job], now: Optional[datetime] = None) -> float:
@@ -431,6 +463,8 @@ class AllocationEngine:
             reason=reason,
             candidates=candidates,
             event=event,
+            size_spread=relative_size_spread([c.size_minutes for c in candidates]) if candidates else None,
+            similarity_threshold=JOB_SIZE_SIMILARITY_THRESHOLD,
         )
 
     def finalize_assignment(

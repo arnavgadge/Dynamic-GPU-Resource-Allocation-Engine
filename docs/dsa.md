@@ -383,6 +383,67 @@ The three structures cooperate in one path: the Priority Queue picks
 *which job*, the Min-Heap picks *which GPU*, and the hash maps resolve
 the ids both decisions touch without scanning.
 
+## Adaptive FCFS / SJF Scheduling
+
+**The rule.** Before any scoring, `AllocationEngine.select_next_job`
+asks one question of the waiting jobs (after the CRITICAL-tier gate
+has narrowed the pool): `are_job_sizes_similar(jobs)`
+(`allocation/similarity.py`). The metric is the relative size spread
+`(largest − smallest) / largest`; the threshold is
+`JOB_SIZE_SIMILARITY_THRESHOLD` (0.20, `allocation/config.py`) and can
+be overridden per call (`threshold=`). A spread exactly at 20% counts
+as similar.
+
+| Spread | Mode | Winner |
+|---|---|---|
+| ≤ 20% (10 min vs 12 min → 16.7%) | **FCFS** | earliest `submitted_at` (ties: queue order) |
+| > 20% (15 min vs 60 min → 75%) | **SJF / Weighted** | highest blended score via the Priority Queue (ties: earliest `submitted_at`) |
+
+**Blended, not tiered.** Neither mode is a hard `HIGH > MEDIUM > LOW`
+gate. In weighted mode priority is 60% of the score, size 40%, plus
+aging — so a much smaller MEDIUM job can beat a large HIGH one (the
+`ml_video` scenario), and in FCFS mode arrival order decides
+regardless of priority (`test_engine.py::test_scenario_2`). Only
+`CRITICAL` narrows the candidate pool first. This is the project's
+deliberate policy; the Day 6 tests pin it.
+
+**Aging coexists.** Aging is one term inside the weighted score (0.01
+per minute, capped at 1.1), so it acts exactly where scores are
+computed: a long-waiting job can overtake a fresher, better-scoring
+one in weighted mode. FCFS mode never needs it — the longest waiter
+already wins — and reports `score = None` because no score was
+computed.
+
+**Decision trace.** Every `AllocationDecision` now carries the numbers
+behind the mode choice — `size_spread`, `similarity_threshold`, each
+candidate's `arrival_position`, priority, size, waiting time and (in
+weighted mode) priority/size/aging components and final score — and
+`decision.explain()` renders them:
+
+```
+Policy: SJF / Weighted
+Size spread: 75.0% (beyond the 20% threshold)
+Reason: no critical jobs waiting - scoring open to all waiting jobs; job sizes differ beyond 20% (spread=75.0%) -> score-based selection; A scored highest (0.690, incl. +0.090 aging) | routed: GPU-1 has the lowest utilization (0.0%) among 1 available GPU(s)
+Candidates:
+  #1 A user=U-A MEDIUM size=15min waited=0:09:00 score 0.690 = base 0.600 (priority component 0.333, size component 1.000) + aging 0.090
+  #2 B user=U-B MEDIUM size=60min waited=0:08:00 score 0.280 = base 0.200 (priority component 0.333, size component 0.000) + aging 0.080
+Selected: A -> GPU-1
+```
+
+**How each structure participates in the pipeline:**
+
+| Structure | Role in the adaptive pipeline |
+|---|---|
+| `Queue` (`WaitingJobQueue`) | Holds the waiting jobs in arrival order; FCFS ties resolve by this order. |
+| Priority Queue / Max-Heap | Picks the highest-scoring candidate in weighted mode. |
+| HashMap / `SchedulerState` dicts | Resolve job → user → GPU ids during scoring and commit. |
+| Min-Heap | After the job is chosen, picks the least-utilized *available* GPU. |
+| Weighted scoring | Combines priority, size and aging (weighted mode only). |
+
+Cost per decision: O(k) to compute the spread and pick the FCFS
+winner, or O(k log k) to score and heap-order k candidates, then
+O(g log g) for GPU routing.
+
 ## Two extra project concepts, not separate data structures
 
 - **Weighted scoring** — the allocation-score formula

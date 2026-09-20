@@ -28,9 +28,10 @@ happens to reproduce one illustrative example. See the Phase 3
 section of the README for this call-out.
 """
 
-from typing import Sequence
+from typing import Iterable, Sequence
 
 from engine.allocation.config import JOB_SIZE_SIMILARITY_THRESHOLD
+from engine.models.job import Job
 
 
 def relative_size_spread(sizes: Sequence[float]) -> float:
@@ -51,6 +52,23 @@ def relative_size_spread(sizes: Sequence[float]) -> float:
     return (largest - smallest) / largest
 
 
-def sizes_are_similar(sizes: Sequence[float]) -> bool:
-    """Whether ``sizes`` are within the project's similarity threshold."""
-    return relative_size_spread(sizes) <= JOB_SIZE_SIMILARITY_THRESHOLD
+def sizes_are_similar(sizes: Sequence[float], threshold: float = JOB_SIZE_SIMILARITY_THRESHOLD) -> bool:
+    """Whether ``sizes`` are within the similarity ``threshold`` (the
+    project's `JOB_SIZE_SIMILARITY_THRESHOLD` unless a caller passes
+    another - the threshold is explicit and configurable, never a
+    literal buried in a comparison). A spread *exactly at* the
+    threshold counts as similar."""
+    return relative_size_spread(sizes) <= threshold
+
+
+def are_job_sizes_similar(jobs: Iterable[Job], threshold: float = JOB_SIZE_SIMILARITY_THRESHOLD) -> bool:
+    """Whether the waiting ``jobs`` are close enough in size to be
+    scheduled FCFS instead of by score (Day 6). The one predicate
+    `AllocationEngine.select_next_job` asks - a thin wrapper over
+    `sizes_are_similar` on each job's `estimated_size_minutes`, so
+    there is still exactly one definition of "similar".
+
+    Examples: 10 and 12 minutes -> spread 16.7% -> True (FCFS);
+    15 and 60 minutes -> spread 75% -> False (score-based / SJF).
+    """
+    return sizes_are_similar([job.estimated_size_minutes for job in jobs], threshold)

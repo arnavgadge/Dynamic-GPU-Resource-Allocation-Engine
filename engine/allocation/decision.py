@@ -21,6 +21,11 @@ class AllocationPolicy(Enum):
     FCFS = "FCFS"
     SCORE_BASED = "SCORE_BASED"
 
+    @property
+    def label(self) -> str:
+        """Human-readable scheduling mode for a decision trace."""
+        return "FCFS" if self is AllocationPolicy.FCFS else "SJF / Weighted"
+
 
 @dataclass(frozen=True)
 class CandidateInfo:
@@ -56,6 +61,12 @@ class CandidateInfo:
     priority_component: Optional[float] = None
     size_component: Optional[float] = None
 
+    #: 1 = earliest-submitted among the candidates of this decision
+    #: (ties keep queue order) - the FCFS ordering, shown in the
+    #: trace for both modes so a reader can see arrival order next to
+    #: the score that may have overridden it.
+    arrival_position: Optional[int] = None
+
 
 @dataclass
 class AllocationDecision:
@@ -76,3 +87,37 @@ class AllocationDecision:
     reason: str
     candidates: List[CandidateInfo]
     event: Event
+
+    #: The relative size spread of the candidates and the threshold it
+    #: was judged against (Day 6) - the numbers behind the FCFS vs.
+    #: SJF/weighted choice, structured rather than only inside `reason`.
+    size_spread: Optional[float] = None
+    similarity_threshold: Optional[float] = None
+
+    def explain(self) -> str:
+        """The decision as a readable trace: mode, why, every
+        candidate (arrival order, priority, size, wait, score
+        breakdown), and the winner."""
+        lines = [f"Policy: {self.policy.label}"]
+        if self.size_spread is not None and self.similarity_threshold is not None:
+            relation = "within" if self.size_spread <= self.similarity_threshold else "beyond"
+            lines.append(
+                f"Size spread: {self.size_spread:.1%} ({relation} the {self.similarity_threshold:.0%} threshold)"
+            )
+        lines.append(f"Reason: {self.reason}")
+        lines.append("Candidates:")
+        for c in sorted(self.candidates, key=lambda c: c.arrival_position or 0):
+            if c.score is None:
+                score = "score n/a (FCFS - not computed)"
+            else:
+                score = (
+                    f"score {c.score:.3f} = base {c.base_score:.3f} (priority component "
+                    f"{c.priority_component:.3f}, size component {c.size_component:.3f}) "
+                    f"+ aging {c.aging_component:.3f}"
+                )
+            lines.append(
+                f"  #{c.arrival_position} {c.job_id} user={c.user_id} {c.priority.name} "
+                f"size={c.size_minutes:g}min waited={c.waiting_time} {score}"
+            )
+        lines.append(f"Selected: {self.job_id} -> {self.gpu_id}")
+        return "\n".join(lines)
