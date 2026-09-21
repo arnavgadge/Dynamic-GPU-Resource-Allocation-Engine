@@ -92,6 +92,17 @@ class _GPUWatch:
     #: before it is prompted a second time.
     confirmed_at: Optional[datetime] = None
 
+    #: The job this watch last saw holding the GPU, and when it first
+    #: saw it there (Day 7). A GPU's utilization history belongs to
+    #: whoever held it *at the time*: idle readings taken while the GPU
+    #: was unassigned, or while a previous job (already completed) held
+    #: it, are no evidence about the current holder, so breach
+    #: detection only looks at readings from `holder_since` onward.
+    #: Without this, a job that had just been handed a long-idle GPU
+    #: was asked "are you still using this GPU?" within a minute or two.
+    tracked_job_id: Optional[str] = None
+    holder_since: Optional[datetime] = None
+
     prompt_pending: bool = False
     prompt_tier: Optional[ReclamationTierPolicy] = None
     prompted_at: Optional[datetime] = None
@@ -171,8 +182,15 @@ class ReclamationEngine:
 
         if gpu.assigned_job_id is None:
             # Nothing assigned - there is no one to prompt and
-            # nothing to reclaim.
+            # nothing to reclaim. Forget the previous holder, so the
+            # next job to get this GPU starts with a clean baseline.
+            watch.tracked_job_id = None
+            watch.holder_since = None
             return None
+
+        if watch.tracked_job_id != gpu.assigned_job_id:
+            watch.tracked_job_id = gpu.assigned_job_id
+            watch.holder_since = now
 
         tier = self._detect_tier(watch, now)
         if tier is None:
@@ -184,6 +202,8 @@ class ReclamationEngine:
         observations = watch.window.observations(now)
         if watch.confirmed_at is not None:
             observations = [obs for obs in observations if obs.timestamp > watch.confirmed_at]
+        if watch.holder_since is not None:
+            observations = [obs for obs in observations if obs.timestamp >= watch.holder_since]
 
         # Tier 1 first: a lower threshold held for a shorter duration
         # is the stronger, faster signal (see `ReclamationTier`'s
@@ -402,6 +422,7 @@ class ReclamationEngine:
         job = self.state.get_job(gpu.assigned_job_id) if gpu.assigned_job_id else None
         user_id = gpu.assigned_user_id
         user = self.state.get_user(user_id) if user_id else None
+        previous_status = gpu.status.value
 
         if job is not None:
             if gpu.gpu_id in job.assigned_gpu_ids:
@@ -456,7 +477,11 @@ class ReclamationEngine:
             gpu, EventType.RECLAIM, now, reason=reason,
             message=f"Reclaimed {gpu.gpu_id} from {user_label}",
             user_id=user_id, job_id=job.job_id if job is not None else None,
-            metadata={"category": category},
+            metadata={
+                "category": category,
+                "previous_status": previous_status,
+                "resulting_status": GPUStatus.IDLE.value,
+            },
         )
         self._history.record_reclaim(event)
 
@@ -497,13 +522,22 @@ class ReclamationEngine:
         Returns ``True`` if anything was actually cleared.
         """
         watch = self._watches.get(gpu_id)
-        if watch is None or not watch.prompt_pending:
+        if watch is None:
+            return False
+        # Always restart the monitoring baseline (Day 7): the GPU's
+        # assignment context just changed hands, so idle readings
+        # gathered under the *previous* holder must not count towards a
+        # sustained breach for whoever gets it next - even when no
+        # prompt happened to be pending at that moment.
+        watch.confirmed_at = now
+        watch.tracked_job_id = None
+        watch.holder_since = None
+        if not watch.prompt_pending:
             return False
         watch.prompt_pending = False
         watch.prompt_tier = None
         watch.prompted_at = None
         watch.request_context = None
-        watch.confirmed_at = now
         return True
 
     def cancel_pending_requests_for_job(self, job_id: str, now: datetime) -> List[str]:

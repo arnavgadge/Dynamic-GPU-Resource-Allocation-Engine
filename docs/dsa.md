@@ -444,6 +444,81 @@ Cost per decision: O(k) to compute the spread and pick the FCFS
 winner, or O(k log k) to score and heap-order k candidates, then
 O(g log g) for GPU routing.
 
+## GPU Reclamation & the Sliding Window
+
+**Why a Sliding Window.** A single utilization reading is noise: a GPU
+at 2% for one sample may just be loading its next batch. Reclamation
+must judge a *span of time*, so `UtilizationSlidingWindow` (built on the
+FIFO `Queue`) keeps only the readings inside a trailing window sized to
+the longest tier (2h30), evicting from the front as new samples arrive
+— amortized O(1) per reading, and the check never rescans a GPU's whole
+history. `is_sustained_breach` then reasons over **timestamps**, not
+counts, so irregular sampling is handled correctly: five readings in two
+minutes are not "sustained", and a monitoring gap does not count as
+evidence.
+
+| Tier | Condition (continuous, up to the latest reading) | Default |
+|---|---|---|
+| 1 | utilization **< 2%** for the full duration | 25 min |
+| 2 | utilization **< 15%** for the full duration | 2 h 30 min |
+
+Exactly-at-threshold values (2.0%, 15.0%) are not "below"; exactly the
+full duration counts as sustained. Tier 1 is checked first. Any reading
+at/above the threshold inside the window breaks the streak — brief dips
+(`80, 78, 2, 3, 75, 82`) never trigger anything.
+
+**A GPU's history belongs to its holder.** Breach detection only counts
+readings taken since the *current* holder's tenure began
+(`_GPUWatch.holder_since`, set when the engine first sees a job on the
+GPU and cleared when it is unassigned), after the last YES/reclaim
+(`confirmed_at`), and `clear_watch_for_gpu` restarts the baseline on
+completion/force-reclaim/failure even with no prompt pending. Otherwise
+idle readings from an unassigned GPU or a completed job would make a
+brand-new holder look "sustained idle" within minutes (a bug found and
+fixed on Day 7).
+
+**State machine** (one machine, reused by every trigger — tiers,
+estimated completion, resource requests, priority preemption):
+
+```
+ACTIVE ─(sustained breach)→ IDLE_WARNING + PROMPT event
+   ├─ YES ───────→ ACTIVE   (timer reset; RESPONSE + STATUS events)
+   ├─ NO ────────→ RECLAIM ─→ IDLE
+   └─ no reply for 5 min ──→ RECLAIM ─→ IDLE   (`no_response_grace_period`)
+IDLE ─(Scheduler.try_allocate_all → AllocationEngine)→ ACTIVE  (ALLOC + STATUS events)
+```
+
+`IDLE_WARNING` is a `GPUStatus`, announced by the PROMPT event;
+"reallocation" is the ordinary ALLOC event that follows the RECLAIM —
+no separate event types were invented. The prompt is addressed to the
+affected user (`event.user_id`), and the grace period is 5 **minutes**
+(pinned by a test, including the live `SimulationSession`).
+
+**Reclaim history.** Every reclaim pushes its RECLAIM event onto
+`ReclaimHistory` (a `Stack`, most recent first). The event carries GPU,
+user, job, reason, timestamp, and `metadata`: `category`
+(`AUTOMATIC_RECLAIM`, `RESOURCE_REQUEST` or `PRIORITY_PREEMPTION`),
+`previous_status` and `resulting_status`. Normal completion
+(`JOB_COMPLETION`), admin release (`ADMIN_FORCE_RECLAIM`) and
+`HARDWARE_FAILURE` are distinct events and never enter the history.
+
+**Partial multi-GPU.** Reclamation works per GPU: only a GPU that itself
+stays idle long enough is prompted, so a 4-GPU job with two busy GPUs
+keeps those two (and stays RUNNING) while the two idle ones return to
+the pool and serve a waiting job, which may still need more.
+
+**Structures in the path:** Sliding Window → sustained detection; Stack
+→ reclaim history; hash maps → GPU/job/user resolution during the
+reclaim; Priority Queue + Queue → who receives the freed GPU; Min-Heap
+→ which free GPU the router hands them.
+
+**Not done (noted):** `Scheduler.respond_to_prompt` and
+`check_reclamation_timeouts` reclaim but do not themselves call
+`try_allocate_all`; the API session, simulator and `MonitorPoller` do
+that immediately afterwards. There is also no `MONITOR` event on the
+live path (only in sample data) — logging one per reading would be
+noise.
+
 ## Two extra project concepts, not separate data structures
 
 - **Weighted scoring** — the allocation-score formula
