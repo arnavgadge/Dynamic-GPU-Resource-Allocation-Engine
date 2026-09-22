@@ -22,7 +22,13 @@ from typing import List, Optional
 from engine.allocation.decision import AllocationDecision, AllocationPolicy, CandidateInfo
 from engine.allocation.engine import AllocationEngine
 from engine.balancing.config import BalancingPolicy, DEFAULT_BALANCING_POLICY
-from engine.balancing.decision import RoutingDecision, RoutingOutcome
+from engine.balancing.decision import (
+    LoadBalancingCandidate,
+    LoadBalancingTrace,
+    ReallocationPath,
+    RoutingDecision,
+    RoutingOutcome,
+)
 from engine.balancing.router import LoadBalancingRouter
 from engine.models.enums import EventType, GPUStatus, JobStatus, Priority
 from engine.models.event import Event
@@ -75,6 +81,12 @@ class Scheduler:
         self.last_allocation_decision: Optional[AllocationDecision] = None
         self.last_routing_decision: Optional[RoutingDecision] = None
         self.last_resource_request_decision: Optional[ReclamationDecision] = None
+        #: Every `LoadBalancingTrace` built by the most recent
+        #: `_request_additional_gpus_if_needed` call (Day 8) - purely
+        #: observational, read by nothing in this class. Replaced (not
+        #: appended to) on each call, like the `last_*_decision` fields
+        #: above; empty when no waiting job had an outstanding deficit.
+        self.last_balancing_traces: List[LoadBalancingTrace] = []
         self._manual_assignment_seq = itertools.count(1)
 
     # -- setup ----------------------------------------------------------
@@ -159,6 +171,55 @@ class Scheduler:
             and not self.reclamation_engine.is_in_cooldown(gpu.gpu_id, now, self.router.policy.preemption_cooldown)
         )
 
+    def _shared_skip_reason(self, gpu: GPU, job: Job, now: datetime) -> Optional[str]:
+        """Day 8: the same checks `_eligible_candidate` makes, but
+        returning *why* a GPU failed instead of only whether it did -
+        for `LoadBalancingTrace`, never for the real filtering logic
+        above (which stays exactly as it was).
+        """
+        if not gpu.is_assigned:
+            return "not assigned"
+        if gpu.assigned_user_id == job.user_id:
+            return "held by the requester"
+        if self.reclamation_engine.has_pending_prompt(gpu.gpu_id):
+            return "prompt already pending"
+        if self.reclamation_engine.has_declined_for(gpu.gpu_id, job.job_id):
+            return "already declined for this job"
+        if self.reclamation_engine.is_in_cooldown(gpu.gpu_id, now, self.router.policy.preemption_cooldown):
+            return "in cooldown"
+        return None
+
+    def _load_balancing_candidates(
+        self, job: Job, now: datetime, path: ReallocationPath, selected_ids: set,
+        extra_skip_reason,
+    ) -> List[LoadBalancingCandidate]:
+        """Day 8: the full, explainable candidate list behind one
+        `LoadBalancingTrace` - every GPU in the pool, whether or not it
+        was actually asked, with its utilization, holder, cooldown
+        status, and (if skipped) why. ``extra_skip_reason(gpu)`` layers
+        the path-specific rule (underutilization or priority/score) on
+        top of the shared guard above.
+        """
+        candidates = []
+        for gpu in self.state.gpus.values():
+            in_cooldown = self.reclamation_engine.is_in_cooldown(gpu.gpu_id, now, self.router.policy.preemption_cooldown)
+            if gpu.gpu_id in selected_ids:
+                # Selected earlier in this same pass, before the ask it
+                # triggered changed its state (e.g. raised its own
+                # pending prompt) - it was eligible *at selection time*,
+                # which is the only honest thing to report here.
+                reason = None
+            else:
+                reason = self._shared_skip_reason(gpu, job, now)
+                if reason is None:
+                    reason = extra_skip_reason(gpu)
+            candidates.append(LoadBalancingCandidate(
+                gpu_id=gpu.gpu_id, utilization_percent=gpu.utilization_percent,
+                holder_user_id=gpu.assigned_user_id, eligible=reason is None,
+                skip_reason=reason, in_cooldown=in_cooldown, selected=gpu.gpu_id in selected_ids,
+            ))
+        return candidates
+
     def _request_additional_gpus_if_needed(self, now: datetime) -> None:
         """Once no genuinely free GPU is left to route (the loop above
         just broke), any still-WAITING job that cannot be fully
@@ -199,6 +260,7 @@ class Scheduler:
         """
         underutilized_threshold = self.reclamation_engine.policy.tier2.utilization_threshold_percent
         cooldown = self.router.policy.preemption_cooldown
+        self.last_balancing_traces = []
 
         for job in self.state.get_waiting_jobs():
             deficit = job.gpus_still_needed
@@ -241,6 +303,16 @@ class Scheduler:
                         self.last_resource_request_decision = decision
                     asked_gpu_ids.add(gpu.gpu_id)
 
+                self.last_balancing_traces.append(LoadBalancingTrace(
+                    timestamp=now, job_id=job.job_id, path=ReallocationPath.EXCESS_CAPACITY, deficit=deficit,
+                    candidates=self._load_balancing_candidates(
+                        job, now, ReallocationPath.EXCESS_CAPACITY, asked_gpu_ids,
+                        lambda gpu: None if gpu.utilization_percent < underutilized_threshold else "not underutilized enough",
+                    ),
+                    selected_gpu_ids=sorted(asked_gpu_ids),
+                    reason=f"{job.job_id} needs {deficit} more GPU(s); asked {len(asked_gpu_ids)} underutilized holder(s)",
+                ))
+
             remaining_deficit = deficit - len(asked_gpu_ids)
             if remaining_deficit <= 0:
                 continue
@@ -281,8 +353,20 @@ class Scheduler:
                 pair = [job, holder_job]
                 return self.allocation_engine.calculate_score(job, pair) > self.allocation_engine.calculate_score(holder_job, pair)
 
+            def _preemption_skip_reason(gpu: GPU) -> Optional[str]:
+                if self._holder_priority(gpu).value >= requester_priority.value:
+                    return "priority not outranked"
+                holder_job = self.state.get_job(gpu.assigned_job_id) if gpu.assigned_job_id else None
+                if holder_job is None:
+                    return "no running job on this GPU"
+                pair = [job, holder_job]
+                if self.allocation_engine.calculate_score(job, pair) > self.allocation_engine.calculate_score(holder_job, pair):
+                    return None
+                return "does not out-score the current holder"
+
             outranked_candidates = [gpu for gpu in self.state.gpus.values() if gpu.gpu_id not in asked_gpu_ids and _preemption_eligible(gpu)]
             outranked_candidates.sort(key=lambda gpu: (self._holder_priority(gpu).value, gpu.gpu_id))
+            preempted_ids: set = set()
             for gpu in outranked_candidates[:remaining_deficit]:
                 holder_label = self._label_for_holder(gpu)
                 self._log_event(
@@ -302,6 +386,20 @@ class Scheduler:
                 )
                 if decision is not None:
                     self.last_resource_request_decision = decision
+                preempted_ids.add(gpu.gpu_id)
+
+            self.last_balancing_traces.append(LoadBalancingTrace(
+                timestamp=now, job_id=job.job_id, path=ReallocationPath.PRIORITY_PREEMPTION, deficit=remaining_deficit,
+                candidates=[
+                    c for c in self._load_balancing_candidates(
+                        job, now, ReallocationPath.PRIORITY_PREEMPTION, preempted_ids, _preemption_skip_reason,
+                    )
+                    if c.gpu_id not in asked_gpu_ids
+                ],
+                selected_gpu_ids=sorted(preempted_ids),
+                reason=f"{job.job_id} ({requester_priority.name}) needs {remaining_deficit} more GPU(s); "
+                       f"asked {len(preempted_ids)} genuinely lower-priority holder(s)",
+            ))
 
     def _label_for_holder(self, gpu: GPU) -> str:
         holder = self.state.get_user(gpu.assigned_user_id)

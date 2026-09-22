@@ -49,3 +49,63 @@ class RoutingDecision:
     outcome: RoutingOutcome
     reason: str
     event: Event
+
+
+class ReallocationPath(Enum):
+    """Which of `Scheduler._request_additional_gpus_if_needed`'s two
+    reallocation paths a `LoadBalancingTrace` is for (Day 8) - never a
+    second scheduling policy, just which existing eligibility rule was
+    being applied when the candidates below were evaluated."""
+
+    #: A multi-GPU request asking another user's *underutilized* GPU.
+    EXCESS_CAPACITY = "EXCESS_CAPACITY"
+    #: A higher-priority arrival asking a genuinely lower-priority holder.
+    PRIORITY_PREEMPTION = "PRIORITY_PREEMPTION"
+
+
+@dataclass(frozen=True)
+class LoadBalancingCandidate:
+    """One already-assigned GPU's numbers, as considered for one
+    reallocation ask (Day 8) - the same idea as `GPUCandidateInfo`,
+    for the "ask another user to release theirs" path rather than the
+    router's "place new work" path. Purely observational: recorded
+    *after* the real eligibility check every ask already makes, never
+    a second copy of that logic.
+    """
+
+    gpu_id: str
+    utilization_percent: float
+    holder_user_id: Optional[str]
+    eligible: bool
+    #: Why this candidate was *not* asked, or `None` if it was eligible.
+    #: One of: "not assigned", "held by the requester", "prompt already
+    #: pending", "already declined for this job", "in cooldown", "not
+    #: underutilized enough" (path EXCESS_CAPACITY only), "priority not
+    #: outranked" / "does not out-score the current holder" (path
+    #: PRIORITY_PREEMPTION only).
+    skip_reason: Optional[str]
+    #: Whether a resource-request/preemption cooldown is currently
+    #: active on this GPU, regardless of whether that is *why* it was
+    #: skipped (surfaced separately - see `docs/dsa.md` for why
+    #: cooldown deliberately never affects `RoutingDecision`, only this
+    #: reallocation path).
+    in_cooldown: bool
+    selected: bool
+
+
+@dataclass(frozen=True)
+class LoadBalancingTrace:
+    """A complete, explainable record of one reallocation ask made on
+    behalf of one waiting job's remaining GPU deficit - candidates,
+    eligibility, cooldown status, and which (if any) were actually
+    asked. `Scheduler.last_balancing_traces` holds every trace built
+    during the most recent `try_allocate_all` call.
+    """
+
+    timestamp: datetime
+    job_id: str
+    path: ReallocationPath
+    deficit: int
+    candidates: List[LoadBalancingCandidate]
+    selected_gpu_ids: List[str]
+    reason: str

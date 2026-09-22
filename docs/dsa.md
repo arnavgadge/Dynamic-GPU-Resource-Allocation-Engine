@@ -519,6 +519,110 @@ that immediately afterwards. There is also no `MONITOR` event on the
 live path (only in sample data) — logging one per reading would be
 noise.
 
+## GPU Load Balancing & Hysteresis
+
+**Two separate mechanisms, kept apart on purpose:**
+
+```
+GPU utilization
+      ↓
+Identify suitable resources     is_gpu_available (IDLE + unassigned only)
+      ↓
+Compare current utilization     Min-Heap, keyed (utilization_percent, gpu_id)
+      ↓
+Select appropriate GPU          LoadBalancingRouter.route_job
+      ↓
+Allocate NEW work                AllocationEngine.finalize_assignment
+      ↓
+Update utilization/state         GPU/User/Job/UserGPUIndex + ALLOC/STATUS events
+```
+
+1. **Routing new work** (`LoadBalancingRouter.route_job`, unchanged
+   since Phase 5) - a job that needs a GPU is given the least-utilized
+   *available* one via a fresh Min-Heap built each call.
+   `is_gpu_available` excludes anything not plainly `IDLE` -
+   `MAINTENANCE`, `UNAVAILABLE`, and any GPU still `is_assigned` -
+   so an actively-used GPU (even at 4% utilization) is never a
+   candidate, and this path never needs a cooldown of its own: it
+   only ever touches genuinely free GPUs, and a GPU it just routed to
+   is immediately assigned, so it cannot be reconsidered again while
+   busy.
+
+2. **Reallocation asks**
+   (`Scheduler._request_additional_gpus_if_needed`, via
+   `ReclamationEngine.request_gpu_for_reallocation`) - asking
+   *another user* to release a GPU: an underutilized one for a
+   multi-GPU deficit, or a lower-priority one under priority
+   preemption. This never invents a second reclamation mechanism - it
+   raises the exact same confirmation prompt every other trigger uses,
+   and only a real YES/NO (or timeout) actually moves the GPU.
+
+**Min-Heap is a candidate filter, not the whole policy.** The router's
+heap only ever contains GPUs that already passed availability and a
+valid-utilization check - "lowest utilization" is the tie-break among
+*already-eligible* candidates, never a substitute for eligibility
+itself.
+
+**Hysteresis / cooldown** protects path 2 only, because that is the
+only path that can ask about the *same* GPU more than once.
+`BalancingPolicy.preemption_cooldown` (default 10 minutes, configurable) is
+enforced by `ReclamationEngine.is_in_cooldown`, timed from
+`cooldown_start` = the moment a prompt on that GPU was last *resolved*
+(YES or NO) to `cooldown_expiry` = `cooldown_start + preemption_cooldown`;
+a fresh ask on that GPU is blocked until `now >= cooldown_expiry`.
+It is entirely `now`-based (the project's simulated clock in every
+test), never a call counter, so any number of balancing-triggering
+calls inside the window are all blocked alike, and utilization
+oscillating near a threshold (4/8/5/7/4/9%) cannot cause repeated
+asks. Cooldown is **per GPU**, blocks *any* job's ask on that GPU (not
+only the original decliner's), and is distinct from
+`has_declined_for` (which remembers a specific job was told no,
+forever, until that job stops needing GPUs).
+
+**Cooldown never blocks ordinary allocation.** `route_job` never
+consults cooldown at all - once a GPU is genuinely `IDLE` (released
+via NO, reclaimed, or completed), it is immediately routable to any
+new job, even while `is_in_cooldown` still reports true for
+reallocation-ask purposes. Cooldown only ever prevents a *repeated
+ask*; it never marks a GPU unavailable, and never outlives the GPU's
+own real state.
+
+**Multi-GPU load balancing** reuses the existing allocation policy
+per GPU: `try_allocate_all`'s loop calls the router once per
+available GPU, so a 3-GPU request is satisfied by three independent,
+eligibility-checked routing decisions, never a blind "three lowest
+numbers" pick - a busy GPU at 1% is never chosen over free GPUs at
+40/45/50%, because it never becomes a candidate in the first place.
+
+**User isolation.** `GPU.utilization_percent` is a raw signal only;
+whether a GPU is *available* depends solely on `is_gpu_available`
+(assignment + status), never utilization. A GPU a user holds at 3% is
+never "globally free" - the only ways another user can receive it are
+(a) a genuine reclaim under the established sustained-utilization
+policy, or (b) a resolved reallocation ask under this hysteresis
+policy. Both always go through the one real confirmation flow;
+neither is bypassed here.
+
+**Decision trace.** `RoutingDecision` (unchanged) already lists every
+GPU considered, utilization, and availability for ordinary routing.
+Day 8 adds `LoadBalancingTrace`/`LoadBalancingCandidate`
+(`engine/balancing/decision.py`) for the reallocation-ask path:
+per candidate, utilization, holder, eligibility, `in_cooldown`, and -
+when ineligible - exactly why (`"not underutilized enough"`,
+`"priority not outranked"`, `"in cooldown"`, `"already declined for
+this job"`, …). `Scheduler.last_balancing_traces` holds every trace
+built by the most recent call, purely observational - it changes no
+selection logic, only makes the existing one explainable. Events
+(`BALANCE` for routing, `REQUEST`/`PRIORITY_PREEMPTION` for asks,
+`ALLOC`/`STATUS` for the resulting placement) are unchanged.
+
+**Design decision preserved, not changed (per the brief's own
+caution):** an idle-but-still-assigned GPU is *never* treated as
+routable new-work capacity by `route_job`. The only way it becomes
+available to someone else is the reallocation-ask flow above, which
+always asks the current holder first. Nothing here weakens that
+ownership boundary.
+
 ## Two extra project concepts, not separate data structures
 
 - **Weighted scoring** — the allocation-score formula
