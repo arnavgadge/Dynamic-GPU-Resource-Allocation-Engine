@@ -281,8 +281,8 @@ def test_cooldown_never_blocks_ordinary_routing_of_a_genuinely_free_gpu():
 def test_cooldown_does_not_make_a_gpu_permanently_unavailable():
     """A GPU touched by a resolved reallocation ask must not stay
     effectively unusable for the rest of the cooldown window - once
-    whoever ends up holding it finishes, the very next job can still
-    get it immediately."""
+    whoever ends up holding it finishes, the very next eligible job can
+    still get it immediately, cooldown or not."""
     scheduler = sched(cooldown_minutes=5)
     add_gpus(scheduler, 1)
     hold(scheduler, "HOLD", "A", priority=Priority.LOW)
@@ -290,6 +290,12 @@ def test_cooldown_does_not_make_a_gpu_permanently_unavailable():
     scheduler.respond_to_prompt("GPU-1", NO, now=at(1.5))          # A releases -> cooldown starts on GPU-1
     scheduler.try_allocate_all(now=at(1.5))
     assert waiter.assigned_gpu_ids == ["GPU-1"]
+    # Day 9: A - preempted, not merely reclaimed - was correctly
+    # requeued rather than dropped; it is no longer this test's
+    # concern, so withdraw it explicitly instead of leaving it as an
+    # incidental (and here, undesired) competitor for GPU-1 later.
+    assert scheduler.state.get_job("HOLD").status == JobStatus.WAITING
+    scheduler.cancel_job("HOLD", now=at(1.6))
 
     scheduler.complete_job("B-JOB", now=at(2))                      # GPU-1 genuinely free again, still "in cooldown"
     assert scheduler.reclamation_engine.is_in_cooldown("GPU-1", at(2), timedelta(minutes=5)) is True

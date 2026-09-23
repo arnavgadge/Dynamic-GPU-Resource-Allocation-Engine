@@ -141,12 +141,27 @@ def calculate_allocation_score(
     job's own `submitted_at` (zero wait) when omitted, so a caller
     that genuinely has no clock available still gets a valid,
     zero-aging score rather than an error.
+
+    Aging reflects time spent *waiting*, exactly like `Job.waiting_time`
+    (Day 9 fix): once a job has started (`job.started_at` is set), its
+    wait is frozen at `started_at - submitted_at` - further elapsed
+    time is time spent *running*, not waiting, and must not keep
+    inflating the score. Every caller before Day 9 only ever scored
+    still-`WAITING` candidates (`started_at is None`), so this was
+    unreachable until the priority-preemption path started scoring a
+    running holder job head-to-head against a waiting requester -
+    without this, a long-running holder's score would keep climbing
+    forever right alongside the requester's, and could never
+    genuinely be overtaken by aging.
     """
     priority_component = calculate_priority_component(job.priority)
     size_component = calculate_size_component(job.estimated_size_minutes, min_size_minutes, max_size_minutes)
     base_score = PRIORITY_WEIGHT * priority_component + SIZE_WEIGHT * size_component
 
-    reference_now = now if now is not None else job.submitted_at
+    if job.started_at is not None:
+        reference_now = job.started_at
+    else:
+        reference_now = now if now is not None else job.submitted_at
     waiting_minutes = max((reference_now - job.submitted_at).total_seconds() / 60.0, 0.0)
     aging_component = calculate_aging_component(waiting_minutes)
 

@@ -424,17 +424,51 @@ class ReclamationEngine:
         user = self.state.get_user(user_id) if user_id else None
         previous_status = gpu.status.value
 
+        is_preemption = request_context is not None and request_context.is_priority_preemption
+        requeue_needed = False
         if job is not None:
             if gpu.gpu_id in job.assigned_gpu_ids:
                 job.assigned_gpu_ids.remove(gpu.gpu_id)
             # A multi-GPU job losing one of several GPUs is not the
             # same as it finishing (Phase 10's explicit caution: don't
             # treat the whole job as complete over one underutilized
-            # GPU) - only mark it RECLAIMED once it holds none at all.
-            # A single-GPU job (`gpu_count == 1`, the default) behaves
-            # exactly as before: its one GPU is always its last.
+            # GPU) - only change its top-level status once it holds
+            # none at all. A single-GPU job (`gpu_count == 1`, the
+            # default) behaves exactly as before: its one GPU is
+            # always its last.
             if not job.assigned_gpu_ids:
-                job.status = JobStatus.RECLAIMED
+                if is_preemption:
+                    # Day 9: preemption is not the same claim as
+                    # reclamation ("this GPU looks abandoned") - the
+                    # preempted job may still genuinely need GPU
+                    # capacity, it simply lost a scheduling contest.
+                    # RECLAIMED previously meant it was silently
+                    # dropped from the waiting system entirely; it now
+                    # goes back to WAITING and re-enters the real FIFO
+                    # (`requeue_job`, idempotent - see Day 5) to
+                    # compete again under the ordinary policy, exactly
+                    # like the brief's "requeue A if it still requires
+                    # resources" - never a duplicate job, never a
+                    # special second queue.
+                    #
+                    # Its FCFS/aging clock restarts from this moment
+                    # (`submitted_at = now`, `started_at` cleared) -
+                    # not left at its original arrival time. Without
+                    # this, a job that had already been RUNNING for a
+                    # while would re-enter the queue looking like the
+                    # single longest-waiting/most-aged candidate, and
+                    # (under equal-size FCFS in particular) could
+                    # immediately win the very GPU it was just
+                    # preempted from back from the job that preempted
+                    # it - defeating the preemption entirely. Job id,
+                    # user id, priority, size, and remaining GPU
+                    # requirement are all otherwise untouched.
+                    job.status = JobStatus.WAITING
+                    job.submitted_at = now
+                    job.started_at = None
+                    requeue_needed = True
+                else:
+                    job.status = JobStatus.RECLAIMED
         if user is not None:
             if gpu.gpu_id in user.assigned_gpu_ids:
                 user.assigned_gpu_ids.remove(gpu.gpu_id)
@@ -467,7 +501,16 @@ class ReclamationEngine:
                 EventType.PRIORITY_PREEMPTION.value if request_context.is_priority_preemption
                 else "RESOURCE_REQUEST"
             )
-            reason = f"resource request from {request_context.requesting_user_name} - {reason_suffix}"
+            if is_preemption:
+                # The affected user's own notification (Day 9) - backend
+                # state/event, never only a frontend-invented string.
+                reason = (
+                    f"your GPU allocation is being reclaimed for a higher-priority scheduling "
+                    f"request from {request_context.requesting_user_name} ({request_context.requesting_job_id}) "
+                    f"- {reason_suffix}"
+                )
+            else:
+                reason = f"resource request from {request_context.requesting_user_name} - {reason_suffix}"
         else:
             category = EventType.AUTOMATIC_RECLAIM.value
             tier_label = tier.tier.value if tier is not None else "UNSPECIFIED"
@@ -489,6 +532,14 @@ class ReclamationEngine:
             self._allocation_engine.mark_gpu_available(gpu.gpu_id)
             if user_id is not None:
                 self._allocation_engine.release_user_gpu(user_id, gpu.gpu_id)
+            if requeue_needed and job is not None:
+                self._allocation_engine.requeue_job(job)
+                self._log_event(
+                    gpu, EventType.STATUS, now,
+                    reason=f"{job.job_id} still needs {job.gpus_still_needed} more GPU(s) - returned to the waiting queue",
+                    message=f"{job.job_id}: preempted, back in the waiting queue",
+                    user_id=user_id, job_id=job.job_id,
+                )
 
         return ReclamationDecision(
             timestamp=now, gpu_id=gpu.gpu_id, tier=tier.tier if tier is not None else None,

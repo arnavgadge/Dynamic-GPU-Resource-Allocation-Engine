@@ -351,7 +351,19 @@ class Scheduler:
                 if holder_job is None:
                     return False
                 pair = [job, holder_job]
-                return self.allocation_engine.calculate_score(job, pair) > self.allocation_engine.calculate_score(holder_job, pair)
+                # `now` is passed explicitly (Day 9 fix) so a job's
+                # aging contribution - the very starvation-prevention
+                # mechanism this comparison exists to honor - actually
+                # counts here. Omitting it (the previous behavior)
+                # silently zeroed aging out of every preemption
+                # decision: `calculate_score`/`allocation_score` treat
+                # a missing `now` as "zero elapsed wait", so a job
+                # waiting two hours and one waiting two minutes were
+                # scored identically for preemption purposes.
+                return (
+                    self.allocation_engine.calculate_score(job, pair, now)
+                    > self.allocation_engine.calculate_score(holder_job, pair, now)
+                )
 
             def _preemption_skip_reason(gpu: GPU) -> Optional[str]:
                 if self._holder_priority(gpu).value >= requester_priority.value:
@@ -360,7 +372,7 @@ class Scheduler:
                 if holder_job is None:
                     return "no running job on this GPU"
                 pair = [job, holder_job]
-                if self.allocation_engine.calculate_score(job, pair) > self.allocation_engine.calculate_score(holder_job, pair):
+                if self.allocation_engine.calculate_score(job, pair, now) > self.allocation_engine.calculate_score(holder_job, pair, now):
                     return None
                 return "does not out-score the current holder"
 
@@ -613,6 +625,12 @@ class Scheduler:
 
         self.allocation_engine.remove_waiting_job(job_id)
         job.status = JobStatus.CANCELLED
+        # Day 9 (preemption safety): a resource-request/preemption ask
+        # may already be outstanding on this job's behalf, asking some
+        # other user to release a GPU it no longer needs now that it's
+        # withdrawn - never leave that prompt standing (the holder
+        # would otherwise be asked to give up their GPU for nothing).
+        self.reclamation_engine.cancel_pending_requests_for_job(job_id, now)
 
         return self._log_event(
             EventType.JOB_CANCELLED, now, gpu_id=None, user_id=job.user_id, job_id=job_id,

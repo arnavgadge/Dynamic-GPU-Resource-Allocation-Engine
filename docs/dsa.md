@@ -623,6 +623,106 @@ available to someone else is the reallocation-ask flow above, which
 always asks the current holder first. Nothing here weakens that
 ownership boundary.
 
+## Priority Preemption & Wait-Time Aging
+
+**Preemption asks the same question every other reclamation trigger
+asks** (`ReclamationEngine.request_gpu_for_reallocation` → the one
+confirm/respond/timeout state machine), just from a different reason:
+*"another waiting job's claim on this GPU is stronger than its current
+holder's."* `Scheduler._request_additional_gpus_if_needed`'s priority
+path (unchanged from Day 8) evaluates it in two steps, both required:
+
+1. **Tier gate** - the requester's `Priority` must *strictly* exceed
+   the holder's. Equal tiers are ordinary allocation competition
+   (Phase 3's territory), never preemption of an already-running job -
+   this is what stops `HIGH > LOW` alone from ever being the reason.
+2. **Score gate** - `AllocationEngine.calculate_score`, the same
+   0.6×priority + 0.4×size + aging formula every allocation decision
+   uses, computed head-to-head between the requester and the holder's
+   job. Only a requester that *out-scores* the holder, not merely
+   out-ranks it, is eligible - the blended-score policy governs
+   preemption exactly like it governs everything else.
+
+Both gates apply identically whether the requester needs 1 GPU or
+several - there is no separate, gpu_count-gated code path for
+single-GPU preemption.
+
+**Two real bugs, both reproduced before fixing:**
+
+- **Preempted jobs used to vanish.** `_reclaim` (the one function
+  every reclamation/preemption/resource-request trigger already
+  shared) always ended a fully-taken job at `JobStatus.RECLAIMED` -
+  correct for a sustained-idle reclaim, wrong for preemption, where
+  the holder plainly still needs a GPU. It now requeues a preempted
+  job instead (`JobStatus.WAITING`, via the already-idempotent
+  `requeue_job`) - and resets `submitted_at`/`started_at` to the
+  requeue moment, so it competes fresh rather than instantly winning
+  its old GPU back off the job that just preempted it under FCFS
+  (verified directly: `test_preempted_job_does_not_immediately_win_
+  its_old_gpu_back`).
+- **Aging was inert for preemption twice over.** `calculate_score`
+  was called without `now` (defaulting to zero wait), so a waiting
+  job's aging never counted toward preempting anyone. Fixing that
+  exposed a second issue: `calculate_allocation_score` measured
+  elapsed time from `submitted_at` unconditionally, so once a
+  *running* holder's own score started being computed for the first
+  time (to compare against a requester's), its score kept "aging"
+  forever too, right alongside the requester's - aging now freezes at
+  `started_at - submitted_at` once a job has started, exactly like
+  `Job.waiting_time` already does. Both fixes are corrective, not new
+  policy - no formula, weight, or threshold changed.
+- **A cancelled requester's ask could outlive it.** `Scheduler.
+  cancel_job` withdrew the job but never called the already-existing
+  `ReclamationEngine.cancel_pending_requests_for_job`, so a holder
+  could still be asked to release a GPU for a job that no longer
+  needed it. `cancel_job` now calls it.
+
+**Partial preemption** falls out of the two existing paths acting
+together, per waiting job, on GPUs individually: the excess-capacity
+path (Day 8) covers underutilized GPUs first; only a genuine remaining
+deficit reaches the priority-preemption gates above, so a holder's
+actively-busy GPUs are asked for only when truly necessary, and a
+holder always keeps whatever the requester's need didn't reach.
+
+**Aging** - unchanged formula, now genuinely reachable everywhere it
+should be:
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| Aging interval | continuous (function of elapsed minutes, not a discrete tick) | Recomputed fresh at every decision from `now - submitted_at` (or the frozen wait once running) |
+| Aging increment | `AGING_RATE_PER_MINUTE = 0.01` | Score gained per minute waited |
+| Maximum contribution | `AGING_MAX_CONTRIBUTION = 1.1` | Hard cap - `min(waiting_minutes * rate, cap)` |
+| Can exceed base score? | Yes, deliberately | The cap (1.1) sits *above* the formula's own maximum base score (1.0 = `PRIORITY_WEIGHT + SIZE_WEIGHT`), so a job waiting `1.1 / 0.01 = 110` minutes always outscores any possible fresh arrival - a real guarantee, not an approximation |
+| Simulated time | `now` is always caller-supplied (the `Scheduler`'s own simulated/test clock) | No wall-clock reads; every test in `test_priority_preemption_aging.py` drives it with explicit, deterministic timestamps |
+
+**Starvation prevention, actually executed, not just inspected:**
+`test_long_waiting_job_eventually_overtakes_a_continuous_stream_of_
+newer_smaller_jobs` runs a real multi-round simulation - a single GPU,
+a fresh small job re-contesting it every 5 simulated minutes - until
+aging lets the one large, low-priority job originally submitted win a
+round outright, and asserts it actually happens within a bounded
+number of rounds.
+
+**Preemption vs. automatic reclamation stay distinct**, exactly as
+before: both end in a `RECLAIM` event through the same `_reclaim`, but
+`metadata["category"]` is `PRIORITY_PREEMPTION` for one and
+`AUTOMATIC_RECLAIM` for the other - never the same value, never a
+second event type invented to tell them apart. The affected user's
+own notification is that same backend `RECLAIM` event's `reason`
+("your GPU allocation is being reclaimed for a higher-priority
+scheduling request from …") - the exact event an admin's global feed
+also sees; there is no separate, frontend-only notification.
+
+**DSA roles, unchanged, reused exactly as documented elsewhere in this
+file:** Priority Queue/Max-Heap orders waiting jobs by score for
+ordinary allocation; the Queue preserves arrival order for FCFS ties
+and is what a requeued job re-enters; hash maps resolve user/job/GPU
+ids throughout the preemption flow; the Min-Heap remains the router's
+GPU-selection structure (untouched here); the Sliding Window remains
+sustained-utilization reclamation's own mechanism, never reused for
+preemption's very different, score-based question. No new structure
+was introduced.
+
 ## Two extra project concepts, not separate data structures
 
 - **Weighted scoring** — the allocation-score formula
