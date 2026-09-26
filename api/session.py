@@ -324,3 +324,54 @@ class SimulationSession:
             scheduler.add_user(User(user_id=user_id, name=display_name, priority=Priority.MEDIUM))
         now = self.simulator.clock.now()
         return scheduler.manual_assign_gpu(gpu_id, user_id, now=now)
+
+    # -- administrative controls (Day 11) ----------------------------------
+    # Every method below is a thin, validated pass-through to the one
+    # real `Scheduler` operation of the same name - no scheduling
+    # decision is made here, exactly like every session method above.
+    # `KeyError`/`ValueError` are left to propagate; `api/app.py`
+    # translates them into 404/422 the same way it already does for
+    # `manual_assign_gpu`/`respond_to_prompt`.
+
+    def cancel_job(self, job_id: str) -> Job:
+        scheduler = self.simulator.scheduler
+        now = self.simulator.clock.now()
+        scheduler.cancel_job(job_id, now=now)
+        return scheduler.state.get_job(job_id)
+
+    def force_reclaim(self, gpu_id: str) -> None:
+        scheduler = self.simulator.scheduler
+        now = self.simulator.clock.now()
+        scheduler.force_reclaim(gpu_id, now=now)
+
+    def change_job_priority(self, job_id: str, priority: str) -> Job:
+        try:
+            priority_value = Priority[priority]
+        except KeyError:
+            raise ValueError(f"unknown priority {priority!r}") from None
+        scheduler = self.simulator.scheduler
+        now = self.simulator.clock.now()
+        scheduler.change_job_priority(job_id, priority_value, now=now)
+        return scheduler.state.get_job(job_id)
+
+    def set_gpu_maintenance(self, gpu_id: str) -> None:
+        scheduler = self.simulator.scheduler
+        scheduler.set_gpu_maintenance(gpu_id, now=self.simulator.clock.now())
+
+    def clear_gpu_maintenance(self, gpu_id: str) -> None:
+        scheduler = self.simulator.scheduler
+        scheduler.clear_gpu_maintenance(gpu_id, now=self.simulator.clock.now())
+
+    def simulate_gpu_failure(self, gpu_id: str) -> None:
+        """Manually trigger `Scheduler.handle_gpu_failure` (admin-only,
+        Day 11) - there is no physical NVIDIA hardware in this
+        environment to detect a real failure from (see
+        `docs/setup.md`); this is the same honest, explicit mechanism
+        the real hardware poller would call, exposed for an admin to
+        demonstrate/test the failure-handling path directly."""
+        scheduler = self.simulator.scheduler
+        scheduler.handle_gpu_failure(gpu_id, now=self.simulator.clock.now())
+
+    def recover_gpu_failure(self, gpu_id: str) -> None:
+        scheduler = self.simulator.scheduler
+        scheduler.recover_gpu_failure(gpu_id, now=self.simulator.clock.now())

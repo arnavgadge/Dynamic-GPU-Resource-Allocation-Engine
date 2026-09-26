@@ -134,6 +134,22 @@ class EventType(Enum):
     #: An admin changed a still-WAITING job's priority
     #: (`Scheduler.change_job_priority`, Phase 9).
     PRIORITY_CHANGED = "PRIORITY_CHANGED"
+    #: An admin took a currently-free GPU out of the allocatable pool
+    #: (`Scheduler.set_gpu_maintenance`, Day 11) - previously logged as
+    #: the generic `SYSTEM`, indistinguishable from any other engine-
+    #: lifecycle event; now its own category so an event log/dashboard
+    #: can tell "admin parked this GPU" apart from everything else
+    #: without parsing `reason` text.
+    GPU_MAINTENANCE_ENABLED = "GPU_MAINTENANCE_ENABLED"
+    #: The mirror image - a GPU admin-restored from `MAINTENANCE` back
+    #: to the allocatable pool (`Scheduler.clear_gpu_maintenance`, Day 11).
+    GPU_MAINTENANCE_DISABLED = "GPU_MAINTENANCE_DISABLED"
+    #: A GPU previously marked `UNAVAILABLE` by `handle_gpu_failure` was
+    #: explicitly recovered (`Scheduler.recover_gpu_failure`, Day 11) -
+    #: the counterpart `HARDWARE_FAILURE` never had until now. Manual/
+    #: admin-triggered in this environment (no physical NVIDIA hardware
+    #: to detect a real recovery from) - see `docs/dsa.md`.
+    GPU_RECOVERED = "GPU_RECOVERED"
 
 
 class EngineStatus(Enum):

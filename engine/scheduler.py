@@ -758,7 +758,7 @@ class Scheduler:
             raise ValueError(f"{gpu_id} is currently assigned - resolve its assignment before entering maintenance")
         gpu.status = GPUStatus.MAINTENANCE
         return self._log_event(
-            EventType.SYSTEM, now, gpu_id=gpu_id, user_id=None, job_id=None,
+            EventType.GPU_MAINTENANCE_ENABLED, now, gpu_id=gpu_id, user_id=None, job_id=None,
             message=f"{gpu_id} entered MAINTENANCE - removed from the allocatable pool",
             reason="admin maintenance action",
         )
@@ -777,7 +777,7 @@ class Scheduler:
         gpu.status = GPUStatus.IDLE
         self.allocation_engine.mark_gpu_available(gpu_id)
         event = self._log_event(
-            EventType.SYSTEM, now, gpu_id=gpu_id, user_id=None, job_id=None,
+            EventType.GPU_MAINTENANCE_DISABLED, now, gpu_id=gpu_id, user_id=None, job_id=None,
             message=f"{gpu_id} left MAINTENANCE - available again",
             reason="admin maintenance action",
         )
@@ -856,6 +856,40 @@ class Scheduler:
             message=f"{gpu_id} reported UNAVAILABLE by the hardware layer" + (f" - {user_label} affected" if user_label else ""),
             reason="hardware poll reported this GPU as gone/errored",
             metadata={"category": EventType.HARDWARE_FAILURE.value},
+        )
+        self.try_allocate_all(now=now)
+        return event
+
+    def recover_gpu_failure(self, gpu_id: str, now: Optional[datetime] = None) -> Event:
+        """The counterpart `handle_gpu_failure` never had (Day 11):
+        explicitly restore a GPU previously marked `UNAVAILABLE` back
+        to the allocatable pool - mirrors `clear_gpu_maintenance`
+        exactly (same shape, same "reevaluate the waiting queue
+        immediately" behavior), just for the hardware-failure status
+        instead of the admin-maintenance one.
+
+        This project has no physical NVIDIA hardware to detect a real
+        recovery from (see `docs/setup.md`) - this is the same manual,
+        explicit, testable mechanism `handle_gpu_failure` itself
+        already is, never a claim of automatic physical-failure
+        detection. Raises ``ValueError`` if the GPU is not currently
+        `UNAVAILABLE` - recovering a GPU that never failed (or is
+        merely in `MAINTENANCE`, a different, admin-chosen state) is a
+        caller mistake, not a silent no-op.
+        """
+        now = now or datetime.now(timezone.utc)
+        gpu = self.state.get_gpu(gpu_id)
+        if gpu is None:
+            raise KeyError(f"unknown GPU {gpu_id!r}")
+        if gpu.status != GPUStatus.UNAVAILABLE:
+            raise ValueError(f"{gpu_id} is not UNAVAILABLE (status={gpu.status.value})")
+
+        gpu.status = GPUStatus.IDLE
+        self.allocation_engine.mark_gpu_available(gpu_id)
+        event = self._log_event(
+            EventType.GPU_RECOVERED, now, gpu_id=gpu_id, user_id=None, job_id=None,
+            message=f"{gpu_id} recovered - available again",
+            reason="admin/hardware-layer confirmed recovery",
         )
         self.try_allocate_all(now=now)
         return event

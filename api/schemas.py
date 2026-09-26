@@ -50,3 +50,23 @@ class ManualAssignRequest(BaseModel):
     gpu_id: str = Field(..., min_length=1)
     user_id: str = Field(..., min_length=1)
     display_name: str = Field(..., min_length=1, max_length=64)
+
+
+# -- Administrative controls (Day 11) -----------------------------------
+
+class JobIdRequest(BaseModel):
+    """Names one job by id - `cancel_job`."""
+
+    job_id: str = Field(..., min_length=1)
+
+
+class GpuIdRequest(BaseModel):
+    """Names one GPU by id - `force_reclaim`, the maintenance pair,
+    and the (manual, no-real-hardware) failure/recovery pair."""
+
+    gpu_id: str = Field(..., min_length=1)
+
+
+class ChangePriorityRequest(BaseModel):
+    job_id: str = Field(..., min_length=1)
+    priority: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]

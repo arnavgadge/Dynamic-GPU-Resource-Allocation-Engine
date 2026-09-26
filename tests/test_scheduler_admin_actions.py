@@ -130,7 +130,10 @@ def test_change_job_priority_rejects_a_running_job():
 def test_maintenance_removes_capacity_and_clearing_it_restores_and_reallocates():
     s = _scheduler(2)
     event = s.set_gpu_maintenance("GPU-2", now=BASE)
-    assert event.event_type == EventType.SYSTEM
+    # Day 11: maintenance now logs its own distinct event type instead
+    # of the generic SYSTEM, so an event log can tell it apart from
+    # every other engine-lifecycle event without parsing `reason` text.
+    assert event.event_type == EventType.GPU_MAINTENANCE_ENABLED
     assert s.state.get_gpu("GPU-2").status == GPUStatus.MAINTENANCE
     assert s.allocation_engine.available_gpu_count() == 1  # GPU-1 only
 

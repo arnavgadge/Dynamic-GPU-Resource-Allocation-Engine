@@ -723,6 +723,109 @@ sustained-utilization reclamation's own mechanism, never reused for
 preemption's very different, score-based question. No new structure
 was introduced.
 
+## Administrative Controls
+
+**Automatic scheduler decisions vs. administrative overrides.** Every
+engine in this project (allocation, reclamation, balancing,
+preemption) reaches a decision on its own, from policy - utilization,
+score, sustained-breach duration, cooldown. Administrative controls
+are the opposite: an explicit human action that bypasses or directly
+overrides that policy for one specific job or GPU, always through the
+same `Scheduler`, `SchedulerState`, and DSA structures every automatic
+decision already uses - never a second scheduler, never a parallel
+state, never a hard priority hierarchy replacing the blended score.
+The one place this distinction is *structural*, not just conventional,
+is `force_reclaim`: every other release path (sustained breach,
+preemption, an ordinary resource request) always asks the holder first
+through the real confirmation flow; `force_reclaim` is the sole,
+deliberate exception, reserved for an admin.
+
+| Operation | Method | Event(s) logged |
+|---|---|---|
+| Cancel a waiting job | `Scheduler.cancel_job` | `JOB_CANCELLED` |
+| Force-reclaim one GPU | `Scheduler.force_reclaim` | `ADMIN_FORCE_RECLAIM` |
+| Change a waiting job's priority | `Scheduler.change_job_priority` | `PRIORITY_CHANGED` |
+| Put a free GPU into maintenance | `Scheduler.set_gpu_maintenance` | `GPU_MAINTENANCE_ENABLED` |
+| Take a GPU out of maintenance | `Scheduler.clear_gpu_maintenance` | `GPU_MAINTENANCE_DISABLED` |
+| Mark a GPU failed (manual/hardware-poller) | `Scheduler.handle_gpu_failure` | `HARDWARE_FAILURE` |
+| Recover a previously-failed GPU | `Scheduler.recover_gpu_failure` (Day 11) | `GPU_RECOVERED` |
+
+All seven existed except `recover_gpu_failure` - `handle_gpu_failure`
+had no counterpart to bring a GPU back. It mirrors
+`clear_gpu_maintenance` exactly: requires the GPU be `UNAVAILABLE`
+(never a healthy or merely-`MAINTENANCE` GPU - those are different,
+admin-chosen states), restores it to `IDLE`, marks it available to the
+Min-Heap-backed router again, and reevaluates the waiting queue
+immediately through the ordinary allocation policy. `set_gpu_maintenance`/
+`clear_gpu_maintenance` previously logged the generic `SYSTEM` event -
+indistinguishable from any other engine-lifecycle event - and now log
+their own distinct types, so an event log can tell "admin parked this
+GPU" apart from everything else without parsing `reason` text. No GPU
+is ever deleted by any of these - `MAINTENANCE`/`UNAVAILABLE` GPUs stay
+in `SchedulerState.gpus`, excluded from allocation purely by
+`is_gpu_available` not treating them as `IDLE`.
+
+**Job cancellation** only ever withdraws a still-`WAITING` job
+(`AllocationEngine.remove_waiting_job`, the same interior-removal
+drain-and-rebuild every stale-entry fix in this project already uses) -
+a `RUNNING` job (single- or multi-GPU) is rejected with a clear error,
+never silently ignored or half-cancelled; `complete_job`/
+`respond_to_prompt`/`force_reclaim` are what end a job that already
+holds resources. Cancelling an already-cancelled or unknown job raises
+the same way, never corrupting state. A cancellation also withdraws
+any resource-request/preemption ask still outstanding on that job's
+behalf (`ReclamationEngine.cancel_pending_requests_for_job` - a Day 9
+fix), so a holder is never left waiting on a question nobody needs
+answered anymore.
+
+**Force reclamation** is deliberately GPU-scoped, exactly like every
+other reclamation trigger - there is no separate "reclaim N GPUs from
+this job" algorithm. Partial multi-GPU reclamation is simply calling
+`force_reclaim` once per targeted GPU id: `requested=4, allocated=4` →
+reclaim 2 of them → `allocated=2, remaining=2` (`Job.gpus_still_needed`),
+the job still `RUNNING` on what it kept. The freed GPU(s) go straight
+back through `AllocationEngine.mark_gpu_available` and
+`Scheduler.try_allocate_all`, the same pool and policy every other
+release uses.
+
+**Priority modification** only ever mutates `Job.priority` in place
+and lets the next `try_allocate_all` recompute from scratch - there is
+no separate Priority Queue node to reinsert (this project's waiting
+structures were never a snapshot of a job's priority; they always read
+it live, exactly as documented since Phase 9). The blended score
+(0.6×priority + 0.4×size + aging) still decides everything downstream:
+raising a job's priority changes one input to that formula, never
+grants an automatic win - a small, low-priority job can still lose to
+a much smaller one even after an upgrade if size/aging still favor the
+other side (verified directly, not merely asserted).
+
+**Consistency checking** (`engine/consistency.py`, Day 11) is a pure,
+read-only diagnostic - `check_consistency(scheduler)` walks
+`SchedulerState` and every derived index and returns every violation
+found (GPU/job/user cross-references in both directions, requested ≥
+allocated with remaining computed consistently, no GPU double-booked,
+the `UserGPUIndex` HashMap agreeing with `User.assigned_gpu_ids`, no
+stale/duplicate waiting-queue entries); `assert_consistent` raises if
+anything is wrong. It generalizes the ad-hoc per-test assertion block
+Day 4 already used into one reusable, documented check, and is run
+after every admin operation in `tests/test_admin_controls.py` - the
+one test that verifies the checker itself is honest (`test_
+consistency_checker_detects_a_genuinely_broken_state`) hand-corrupts
+state and confirms it's caught, not just trusted.
+
+**API layer.** `api/app.py` exposes all seven operations as thin,
+admin-only (`require_admin`) POST routes under `/api/admin/*`, each
+calling exactly one `SimulationSession` method (`api/session.py`),
+which itself calls exactly one `Scheduler` method - no scheduling
+decision anywhere in the HTTP layer, the same rule the rest of `api/`
+already follows. Every route returns the resulting admin state and
+broadcasts it over the WebSocket, identically to every pre-existing
+command. The manual GPU-failure endpoint is explicitly a demonstration
+of the same path a real hardware poller would call - there is no
+physical NVIDIA hardware in this environment to trigger or validate a
+real failure/recovery from (see `docs/setup.md`), and nothing here
+claims otherwise.
+
 ## Two extra project concepts, not separate data structures
 
 - **Weighted scoring** — the allocation-score formula

@@ -28,7 +28,10 @@ from api import auth
 from api.auth import Account
 from api.config import TICK_INTERVAL_SECONDS
 from api.schemas import (
+    ChangePriorityRequest,
     GPURequestBody,
+    GpuIdRequest,
+    JobIdRequest,
     LoginRequest,
     ManualAssignRequest,
     PromptResponseRequest,
@@ -329,6 +332,99 @@ def hardware_disable(account: Account = Depends(require_admin)):
 async def manual_assign(body: ManualAssignRequest, account: Account = Depends(require_admin)):
     try:
         session.manual_assign_gpu(body.gpu_id, body.user_id, body.display_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    await _broadcast_state()
+    return get_state()
+
+
+# -- REST: administrative scheduler controls (Day 11) --------------------
+# Thin, admin-only routes over the operations `Scheduler` already
+# implements (cancel_job/force_reclaim/change_job_priority/maintenance/
+# handle_gpu_failure/recover_gpu_failure) - no scheduling decision is
+# made in any handler below; each calls exactly one `SimulationSession`
+# method, which itself calls exactly one `Scheduler` method. Every
+# route returns the resulting admin state and broadcasts it, matching
+# every other command above.
+
+@app.post("/api/admin/cancel-job")
+async def admin_cancel_job(body: JobIdRequest, account: Account = Depends(require_admin)):
+    try:
+        session.cancel_job(body.job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    await _broadcast_state()
+    return get_state()
+
+
+@app.post("/api/admin/force-reclaim")
+async def admin_force_reclaim(body: GpuIdRequest, account: Account = Depends(require_admin)):
+    try:
+        session.force_reclaim(body.gpu_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    await _broadcast_state()
+    return get_state()
+
+
+@app.post("/api/admin/change-priority")
+async def admin_change_priority(body: ChangePriorityRequest, account: Account = Depends(require_admin)):
+    try:
+        session.change_job_priority(body.job_id, body.priority)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    await _broadcast_state()
+    return get_state()
+
+
+@app.post("/api/admin/gpu/maintenance/enable")
+async def admin_enable_maintenance(body: GpuIdRequest, account: Account = Depends(require_admin)):
+    try:
+        session.set_gpu_maintenance(body.gpu_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    await _broadcast_state()
+    return get_state()
+
+
+@app.post("/api/admin/gpu/maintenance/disable")
+async def admin_disable_maintenance(body: GpuIdRequest, account: Account = Depends(require_admin)):
+    try:
+        session.clear_gpu_maintenance(body.gpu_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    await _broadcast_state()
+    return get_state()
+
+
+@app.post("/api/admin/gpu/failure")
+async def admin_simulate_gpu_failure(body: GpuIdRequest, account: Account = Depends(require_admin)):
+    """Manually mark a GPU failed - there is no physical NVIDIA
+    hardware in this environment to detect a real failure from (see
+    `docs/setup.md`); this exercises the same `Scheduler.
+    handle_gpu_failure` path a real hardware poller would call."""
+    try:
+        session.simulate_gpu_failure(body.gpu_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    await _broadcast_state()
+    return get_state()
+
+
+@app.post("/api/admin/gpu/recover")
+async def admin_recover_gpu(body: GpuIdRequest, account: Account = Depends(require_admin)):
+    try:
+        session.recover_gpu_failure(body.gpu_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ValueError as exc:
