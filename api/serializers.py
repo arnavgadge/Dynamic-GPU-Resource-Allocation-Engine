@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional
 from api.auth import ACCOUNTS
 from api.config import ALLOWED_SPEEDS
 from engine.allocation.config import JOB_SIZE_SIMILARITY_THRESHOLD, PRIORITY_WEIGHT, SIZE_WEIGHT
+from engine.balancing.availability import is_gpu_available
+from engine.models.enums import GPUStatus, JobStatus
 from engine.models.gpu import GPU
 from engine.models.job import Job
 from engine.models.scheduler_state import SchedulerState
@@ -107,6 +109,30 @@ def serialize_user(state: SchedulerState, user: User) -> Dict[str, Any]:
     }
 
 
+def serialize_system_overview(scheduler: Scheduler, now: datetime, real_time: Optional[datetime] = None) -> Dict[str, Any]:
+    """The `GET /api/system` summary (Day 12) - pool-wide counts plus
+    engine status, derived purely from `SchedulerState` and the one
+    existing `is_gpu_available` predicate (`engine/balancing/
+    availability.py`) - never a second definition of "available".
+    """
+    state = scheduler.state
+    gpus = list(state.gpus.values())
+    return {
+        "simulated_time": now.isoformat(),
+        "real_time": (real_time or datetime.now(timezone.utc)).isoformat(),
+        "engine_status": state.engine_status.value,
+        "total_gpus": len(gpus),
+        "available_gpus": sum(1 for gpu in gpus if is_gpu_available(gpu)),
+        "allocated_gpus": sum(1 for gpu in gpus if gpu.is_assigned),
+        "maintenance_gpus": sum(1 for gpu in gpus if gpu.status == GPUStatus.MAINTENANCE),
+        "failed_gpus": sum(1 for gpu in gpus if gpu.status == GPUStatus.UNAVAILABLE),
+        "total_users": len(state.users),
+        "waiting_jobs": len(state.get_waiting_jobs()),
+        "active_jobs": len(state.get_running_jobs()),
+        "total_jobs": len(state.jobs),
+    }
+
+
 def _wait_seconds(job: Job, now: datetime) -> float:
     """How long ``job`` has been waiting, using the simulator's clock -
     never `datetime.now()`. For a job that has already started, this
@@ -158,6 +184,24 @@ def serialize_waiting_queue(scheduler: Scheduler, now: datetime) -> List[Dict[st
             "allocation_score": round(score, 3),
         })
     return entries
+
+
+def serialize_job_list(scheduler: Scheduler, now: datetime) -> List[Dict[str, Any]]:
+    """Every job (`GET /api/jobs`, Day 12), each carrying its real
+    `allocation_score` when it's meaningful (a currently-`WAITING` job,
+    scored the same way `serialize_waiting_queue` already does) and
+    ``None`` otherwise - never a fabricated number for a job the
+    engine never scored (already-running/completed/cancelled)."""
+    state = scheduler.state
+    waiting_jobs = state.get_waiting_jobs()
+    scores = {
+        job.job_id: scheduler.allocation_engine.calculate_score(job, waiting_jobs)
+        for job in waiting_jobs
+    } if waiting_jobs else {}
+    return [
+        {**serialize_job(job, now), "allocation_score": round(scores[job.job_id], 3) if job.job_id in scores else None}
+        for job in state.jobs.values()
+    ]
 
 
 def serialize_event(event: Event) -> Dict[str, Any]:

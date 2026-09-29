@@ -1696,6 +1696,154 @@ request in their own portal and releases it -> User B ends up RUNNING
 with all 3 GPUs -> Admin Console agrees) was run against the real,
 live FastAPI app and passes in full.
 
+## API Resource Endpoints & Real-Time Event Stream (Day 12)
+
+### 1. Purpose
+
+Phase 7 gave the dashboard one full-snapshot channel (`GET /api/state`
++ `/ws/state`, a repeating complete payload on every change). Day 12
+adds two things on top, without touching that channel: read-only
+per-resource REST endpoints (so a caller wanting only, say, the GPU
+list doesn't fetch and discard everything else), and a second
+WebSocket, `/ws/events`, that streams *discrete* scheduler events as
+they happen rather than a repeating full state blob. Both are pure
+decompositions of data `serialize_state`/`SchedulerState` already
+expose - no new scheduling computation exists anywhere in `api/`.
+
+    REST (GET /api/system, /gpus, /jobs, /users, /events)  =  current state
+    WebSocket (/ws/events)                                  =  live changes
+
+A frontend fetches its starting point over REST, then listens on
+`/ws/events` for what changes next - it is never expected to
+reconstruct history from the WebSocket alone.
+
+### 2. Read-only resource endpoints
+
+| Route | Returns |
+|---|---|
+| `GET /api/system` | Pool-wide counts (total/available/allocated/maintenance/failed GPUs, waiting/active/total jobs, users) + engine status + both clocks |
+| `GET /api/gpus` | Every GPU, `serialize_gpu` - unchanged shape from `/api/state`'s own `gpus` array |
+| `GET /api/jobs` | Every job, each with `allocation_score` (the real, `AllocationEngine`-computed score) when it's currently `WAITING`, `null` otherwise - never a fabricated number for a job that was never scored |
+| `GET /api/jobs/{job_id}` | One job's status, 404 if unknown |
+| `GET /api/users` | Every user's current allocation state |
+| `GET /api/events?limit=N` | The most recent `N` events (default 200, capped at `MAX_EVENT_HISTORY`), oldest first |
+
+All six are unauthenticated, exactly matching `GET /api/state`'s own
+existing, pre-Phase-9 precedent (the same global-view trust level) -
+none of them exposes anything `/api/state` didn't already expose,
+just split up for callers that want less at once.
+
+### 3. Job operations
+
+Job submission was already real (`POST /api/requests`, Phase 9) and is
+reused unchanged - a second `POST /api/jobs` route was deliberately
+*not* added, since it would do exactly the same thing under a
+different name. What was missing was a way for a user to withdraw
+their *own* still-waiting request without needing an admin:
+`POST /api/jobs/{job_id}/cancel` is new, ownership-checked (a `USER`
+token may only cancel a job that's genuinely theirs; an `ADMIN` token
+may cancel any, matching every other admin override in this project),
+and calls the exact same `SimulationSession.cancel_job` the Day 11
+admin route already uses - never a second cancellation code path.
+
+### 4. Admin operations
+
+All seven Day 11 operations (cancel-job, force-reclaim,
+change-priority, maintenance enable/disable, GPU failure/recovery)
+were already exposed under `/api/admin/*` - Day 12 adds nothing new
+here, only the resource/event layer around them.
+
+### 5. Error mapping
+
+| Status | Meaning | Example |
+|---|---|---|
+| `404` | Unknown job/GPU/scenario id | `GET /api/jobs/NOPE`, cancelling an unknown job |
+| `403` | Caller isn't allowed to do this | A `USER` cancelling another user's job; a non-admin hitting `/api/admin/*` |
+| `409` | The operation conflicts with the resource's current state | Cancelling a `RUNNING` job via `/api/jobs/{id}/cancel` |
+| `422` | Request failed validation, or the operation is invalid for another reason | An out-of-range `gpu_count`; force-reclaiming an unassigned GPU |
+| `401` | No/invalid session token where one is required | Any authenticated route with no `Authorization` header |
+
+`503` (scheduler/hardware unavailable) was not added: this project's
+scheduler is always in-process and always available by construction
+(no external service to be down), and the one real "unavailable"
+condition - real hardware telemetry not present - already has its own
+honest, non-503 shape (`GET /api/hardware/status` reporting
+`enabled: false` with a reason), which Day 12 left unchanged.
+
+### 6. `/ws/events` - the real-time event stream
+
+```
+Scheduler.<operation>
+    v
+SchedulerState.log_event          (the one real event log - unchanged)
+    v
+SimulationSession.pop_new_events()    (Day 12 - diffs the log, never a second detector)
+    v
+EventStreamManager.broadcast_events()   (fan-out, per-connection routing)
+    v
+every connected /ws/events client (filtered to what that client may see)
+```
+
+Every message has the one documented shape:
+
+```json
+{"type": "GPU_ALLOCATED", "timestamp": "2026-01-01T09:05:00+00:00", "data": { "...": "the real Event, serialize_event() unchanged" }}
+```
+
+`type` is always the real `EventType` value already logged (`ALLOC`,
+`RECLAIM`, `PRIORITY_PREEMPTION`, `JOB_CANCELLED`,
+`GPU_MAINTENANCE_ENABLED`, `GPU_RECOVERED`, …, including every Day
+11 admin event type) - never invented or renamed for the wire format.
+`data` is the exact same `serialize_event` payload `/api/events` and
+`/api/state`'s own `events` array already use, so a client parses one
+event shape everywhere in this project, not two.
+
+**How "new" events are found.** `SimulationSession.pop_new_events`
+keeps a reference to the last `Event` object it already returned and,
+on each call, walks `SchedulerState.events` backward until it finds
+that object again - never an index (which `MAX_EVENT_HISTORY`'s
+oldest-first eviction would silently misalign) and never a second,
+independently-maintained log. Called once, from inside the existing
+`_broadcast_state()` helper - so every REST command and every
+background tick that already broadcasts full state to `/ws/state` now
+also fans out whatever events that same operation logged to
+`/ws/events`, with no route needing to remember to call it separately.
+
+**Multiple clients, never blocking the scheduler.** `EventStreamManager`
+mirrors the pre-existing `ConnectionManager` (`/ws/state`) exactly: a
+plain dict of `{websocket: account}`, `connect`/`disconnect` methods,
+and a broadcast loop that wraps each `send_json` in its own
+`try/except`, collecting and dropping any connection that raised
+(a closed socket, a slow/dead client) *after* the loop finishes -
+one bad connection never stops another client's delivery, and a
+`WebSocketDisconnect` is caught the same way `/ws/state` already
+catches one. Nothing in this path can block or fail the scheduler
+itself: state is always mutated first, by the REST handler or the
+background loop; broadcasting is a best-effort side effect afterward.
+
+**User-specific routing.** No token (or an `ADMIN` token) receives
+every event - unchanged Admin Console visibility, matching
+`/ws/state`'s own existing rule. A `USER` token receives only events
+where `event.user_id` equals that account's username - the identical
+filter `serialize_notifications` (Phase 9's portal notifications) has
+always used, applied here to the live stream instead of a polled list.
+A user is never shown another user's "are you still using this GPU?"
+or "your job was preempted" - those events carry that user's own
+`user_id`, and the filter excludes them from anyone else's connection
+before the message is ever sent.
+
+### 7. Real vs. simulated time, unchanged
+
+Every timestamp this layer emits already distinguished simulated time
+(the deterministic clock every engine actually reasons over) from real
+wall-clock time (`GET /api/clock`, purely for display) since Phase 6/
+Issue 5. `GET /api/system` reuses both existing fields
+(`simulated_time`, `real_time`) rather than introducing a third notion
+of "now"; `/ws/events`' own `timestamp` field is each `Event`'s real,
+already-recorded timestamp (simulated time, exactly like every other
+event payload in this project) - never `datetime.now()` computed fresh
+at broadcast time.
+
 ## What this project deliberately does NOT implement
 
 - Any scheduling decision in React/JavaScript, anywhere.
@@ -1709,7 +1857,11 @@ live FastAPI app and passes in full.
   Phase 9/10 endpoints (`/api/requests`, `/api/portal/state`,
   `/api/admin/assign`, `/api/hardware/*`) and `/api/prompt/respond`'s
   ownership check require/use a token. A fuller gate on the admin
-  surface is a reasonable follow-up, not silently claimed here.
+  surface is a reasonable follow-up, not silently claimed here. Day
+  12's own read-only resource endpoints (`/api/system`, `/gpus`,
+  `/jobs`, `/users`, `/events`) and `/ws/events` with no token follow
+  this exact same, already-established precedent - unauthenticated,
+  global-view, nothing they expose that `/api/state` didn't already.
 - Real hardware telemetry unless an admin explicitly enables it
   (`enable_real_hardware`) *and* `detect_gpu_monitor` genuinely finds
   NVML or `nvidia-smi` - never assumed, never faked.

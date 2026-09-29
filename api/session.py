@@ -51,6 +51,12 @@ class SimulationSession:
         # scenario/session itself (`load_scenario`/`reset` below) -
         # never touched by anything simulated-time-related.
         self._session_started_monotonic = time.monotonic()
+        #: The last `Event` object (by identity) already handed to
+        #: `pop_new_events` (Day 12's `/ws/events` stream) - lets each
+        #: poll return only what's new since the previous one, reading
+        #: `SchedulerState.events` (the one real event log) directly
+        #: rather than a second, independently-maintained copy.
+        self._last_broadcast_event = None
         self.load_scenario(initial_scenario_id)
 
         # Real-hardware telemetry (Requirement 1) is entirely optional
@@ -145,12 +151,20 @@ class SimulationSession:
         self.scenario_name = scenario.name
         self.running = False
         self._session_started_monotonic = time.monotonic()
+        # Start the cursor at whatever the fresh scenario already
+        # logged (if anything) - the next `pop_new_events` should only
+        # report what happens *after* this load, not replay the
+        # scenario's own initial events as if they just occurred.
+        events = self.simulator.scheduler.state.events
+        self._last_broadcast_event = events[-1] if events else None
 
     def reset(self) -> None:
         """Reset the current scenario back to its initial state."""
         self.simulator.reset()
         self.running = False
         self._session_started_monotonic = time.monotonic()
+        events = self.simulator.scheduler.state.events
+        self._last_broadcast_event = events[-1] if events else None
 
     # -- real wall-clock (Issue 5) -----------------------------------
     # Purely a display concern - never fed into any scheduling
@@ -375,3 +389,36 @@ class SimulationSession:
     def recover_gpu_failure(self, gpu_id: str) -> None:
         scheduler = self.simulator.scheduler
         scheduler.recover_gpu_failure(gpu_id, now=self.simulator.clock.now())
+
+    # -- real-time event stream (Day 12) -----------------------------------
+
+    def pop_new_events(self) -> list:
+        """Every `Event` appended to `SchedulerState.events` since the
+        last call, oldest first - the one place `/ws/events` (Day 12)
+        finds out what's new. Reads the real event log directly; never
+        a second, independently-detected notion of "what happened".
+
+        Uses object identity, not an index, to survive
+        `MAX_EVENT_HISTORY` trimming (Phase 15) - a plain integer
+        cursor would silently misalign once the list's front is
+        evicted. If the last-seen event is no longer present at all
+        (an extreme case: more than `MAX_EVENT_HISTORY` events arrived
+        in a single call), every currently-held event is returned
+        rather than silently dropping history a client never saw.
+        """
+        events = self.simulator.scheduler.state.events
+        if not events:
+            return []
+        if self._last_broadcast_event is None:
+            new_events = list(events)
+        else:
+            new_events = []
+            for event in reversed(events):
+                if event is self._last_broadcast_event:
+                    break
+                new_events.append(event)
+            else:
+                new_events = list(events)  # sentinel was evicted - resend everything held
+            new_events.reverse()
+        self._last_broadcast_event = events[-1]
+        return new_events

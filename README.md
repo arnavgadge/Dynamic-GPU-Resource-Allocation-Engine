@@ -83,7 +83,7 @@ Full details, diagrams, and worked traces for every layer are in
 | `engine/scheduler.py` | Thin orchestrator over the three engines above — no policy of its own. |
 | `engine/simulation/` | Deterministic scenario simulator — drives the real engines through simulated time, without real hardware or real users. |
 | `engine/hardware/` | The hardware abstraction layer — `GPUMonitor` + simulator/`nvidia-smi`/NVML implementations. |
-| `api/` | FastAPI adapter — REST endpoints + the `/ws/state` WebSocket. Imports `engine/`; `engine/` never imports it. |
+| `api/` | FastAPI adapter — REST resource/command endpoints (`/api/system`, `/gpus`, `/jobs`, `/users`, `/events`, admin controls) + two WebSockets: `/ws/state` (full snapshot) and `/ws/events` (discrete, real-time, user-routed events). Imports `engine/`; `engine/` never imports it. |
 | `frontend/` | React + Vite dashboard — Admin Console and per-user Portal. Renders backend state and sends commands; computes no scheduling decisions. |
 | `tests/`, `frontend/src/__tests__/` | Backend (pytest) and frontend (Vitest) test suites. |
 

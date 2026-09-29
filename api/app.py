@@ -38,7 +38,16 @@ from api.schemas import (
     SetSpeedRequest,
     StepRequest,
 )
-from api.serializers import serialize_portal_state, serialize_state
+from api.serializers import (
+    serialize_event,
+    serialize_gpu,
+    serialize_job,
+    serialize_job_list,
+    serialize_portal_state,
+    serialize_state,
+    serialize_system_overview,
+    serialize_user,
+)
 from api.session import SimulationSession
 from engine.simulation import load_default_registry
 
@@ -87,9 +96,58 @@ class ConnectionManager:
             self.disconnect(connection)
 
 
+class EventStreamManager:
+    """Tracks `/ws/events` (Day 12) connections and fans discrete
+    scheduler events out to them, each shaped like
+    ``{"type": event_type, "timestamp": ..., "data": {...}}``.
+
+    Routing mirrors `ConnectionManager`'s existing state-stream rule
+    exactly: no token (or an ADMIN token) sees every event, unchanged
+    from the Admin Console's pre-existing full visibility; a USER
+    token sees only events about *them* (``event.user_id ==
+    account.username``, the same rule `serialize_notifications`
+    already uses) - never another user's private notification. A
+    disconnected/failing client is dropped, never allowed to raise
+    into the scheduler's own call stack.
+    """
+
+    def __init__(self) -> None:
+        self._connections: Dict[WebSocket, Optional[Account]] = {}
+
+    async def connect(self, websocket: WebSocket, account: Optional[Account]) -> None:
+        await websocket.accept()
+        self._connections[websocket] = account
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        self._connections.pop(websocket, None)
+
+    async def broadcast_events(self, events: list) -> None:
+        if not events or not self._connections:
+            return
+        dead: List[WebSocket] = []
+        for connection, account in list(self._connections.items()):
+            is_admin_view = account is None or account.role != "USER"
+            for event in events:
+                if not is_admin_view and event.user_id != account.username:
+                    continue
+                payload = {
+                    "type": event.event_type.value,
+                    "timestamp": event.timestamp.isoformat(),
+                    "data": serialize_event(event),
+                }
+                try:
+                    await connection.send_json(payload)
+                except Exception:
+                    dead.append(connection)
+                    break
+        for connection in dead:
+            self.disconnect(connection)
+
+
 registry = load_default_registry()
 session = SimulationSession(registry, DEFAULT_SCENARIO_ID)
 manager = ConnectionManager()
+event_stream = EventStreamManager()
 
 
 # -- authentication ----------------------------------------------------
@@ -167,6 +225,11 @@ def _portal_payload(username: str) -> dict:
 
 async def _broadcast_state() -> None:
     await manager.broadcast()
+    # Day 12: every command that changes state also fans out whatever
+    # new `Event`s that change actually logged - `pop_new_events` reads
+    # `SchedulerState.events` (the one real source), never a second,
+    # independently-detected notion of "something happened".
+    await event_stream.broadcast_events(session.pop_new_events())
 
 
 async def _background_loop() -> None:
@@ -230,6 +293,61 @@ def get_clock():
     }
 
 
+# -- REST: resource endpoints (Day 12) ----------------------------------
+# Read-only decompositions of the exact same `serialize_state` already
+# builds for `GET /api/state`/`/ws/state` - same trust level (no auth,
+# matching that pre-existing precedent), same underlying data, just
+# split by resource so a caller that only wants (say) the GPU list
+# doesn't have to fetch and discard everything else. No new scheduling
+# computation lives in any of these - each calls straight into
+# `SchedulerState`/the existing serializers.
+
+@app.get("/api/system")
+def get_system():
+    now = session.simulator.clock.now()
+    return serialize_system_overview(session.simulator.scheduler, now, real_time=session.current_real_time())
+
+
+@app.get("/api/gpus")
+def get_gpus():
+    scheduler = session.simulator.scheduler
+    now = session.simulator.clock.now()
+    return [
+        serialize_gpu(scheduler.state, gpu, scheduler.reclamation_engine, now)
+        for gpu in scheduler.state.gpus.values()
+    ]
+
+
+@app.get("/api/jobs")
+def get_jobs():
+    now = session.simulator.clock.now()
+    return serialize_job_list(session.simulator.scheduler, now)
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    job = session.simulator.scheduler.state.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job {job_id!r}")
+    now = session.simulator.clock.now()
+    return serialize_job(job, now)
+
+
+@app.get("/api/users")
+def get_users():
+    state = session.simulator.scheduler.state
+    return [serialize_user(state, user) for user in state.users.values()]
+
+
+@app.get("/api/events")
+def get_events(limit: int = Query(200, gt=0, le=2000)):
+    """Most recent events, oldest-first (matches `serialize_state`'s
+    own `events` ordering) - capped at `MAX_EVENT_HISTORY` (Phase 15),
+    the most this session ever retains regardless of ``limit``."""
+    events = session.simulator.scheduler.state.events
+    return [serialize_event(event) for event in events[-limit:]]
+
+
 # -- REST: authentication (Part 28/29) ---------------------------------
 # A demonstration login - five seeded accounts, an opaque token, no
 # password. `require_account`/`require_admin` are what every route
@@ -279,6 +397,34 @@ async def submit_gpu_request(body: GPURequestBody, account: Account = Depends(re
         raise HTTPException(status_code=422, detail=str(exc))
     await _broadcast_state()
     return serialize_portal_state(session.simulator, account.username, session.running, session.speed)
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_own_job(job_id: str, account: Account = Depends(require_account)):
+    """A user withdrawing their own still-waiting request - distinct
+    from `/api/admin/cancel-job` (Day 11, admin-only, any job): this
+    one enforces ownership instead of an admin role, the same "never
+    trust the caller, always check against real state" rule
+    `/api/prompt/respond` already applies to GPU ownership. An ADMIN
+    token may still cancel any job (matches the admin override already
+    granted everywhere else in this project); a USER token may only
+    cancel a job that is genuinely theirs.
+    """
+    job = session.simulator.scheduler.state.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"unknown job {job_id!r}")
+    if account.role == "USER" and job.user_id != account.username:
+        raise HTTPException(status_code=403, detail="you may only cancel your own job")
+
+    try:
+        session.cancel_job(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    await _broadcast_state()
+
+    if account.role == "USER":
+        return serialize_portal_state(session.simulator, account.username, session.running, session.speed)
+    return get_state()
 
 
 # -- REST: real hardware telemetry (Requirement 1) ----------------------
@@ -559,3 +705,35 @@ async def state_stream(websocket: WebSocket, token: Optional[str] = Query(None))
         pass
     finally:
         manager.disconnect(websocket)
+
+
+# -- WebSocket: real-time event stream (Day 12) --------------------------
+
+@app.websocket("/ws/events")
+async def events_stream(websocket: WebSocket, token: Optional[str] = Query(None)):
+    """Discrete scheduler events, pushed as they happen -
+    `{"type": event_type, "timestamp": ..., "data": {...}}` per
+    message, oldest-first. This is deliberately *not* a state
+    snapshot: a client fetches current state via REST
+    (`GET /api/state`/`/api/system`/etc.), then connects here for
+    live changes only - exactly `/ws/state`'s existing snapshot-first
+    pattern, just for discrete events instead of a repeating full
+    payload. Routing mirrors `/ws/state`: no token (or ADMIN) sees
+    every event; a USER token sees only events about them.
+
+    Sends nothing on connect (there is no "current event" the way
+    there's a current state) - the first message a client receives is
+    the next real event the scheduler logs. A disconnect is detected
+    the same way `/ws/state` detects one; nothing here can block or
+    fail scheduler execution, since state changes are made by REST
+    handlers/the background loop, never by this endpoint itself.
+    """
+    account = auth.resolve_token(token) if token else None
+    await event_stream.connect(websocket, account)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        event_stream.disconnect(websocket)
