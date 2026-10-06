@@ -52,15 +52,19 @@ class RoutingDecision:
 
 
 class ReallocationPath(Enum):
-    """Which of `Scheduler._request_additional_gpus_if_needed`'s two
-    reallocation paths a `LoadBalancingTrace` is for (Day 8) - never a
-    second scheduling policy, just which existing eligibility rule was
-    being applied when the candidates below were evaluated."""
+    """Which of `Scheduler._request_additional_gpus_if_needed`'s
+    reallocation paths a `LoadBalancingTrace` is for (Day 8/later) -
+    never a second scheduling policy, just which existing eligibility
+    rule was being applied when the candidates below were evaluated."""
 
     #: A multi-GPU request asking another user's *underutilized* GPU.
     EXCESS_CAPACITY = "EXCESS_CAPACITY"
     #: A higher-priority arrival asking a genuinely lower-priority holder.
     PRIORITY_PREEMPTION = "PRIORITY_PREEMPTION"
+    #: A waiting job asking a same-or-lower-priority holder to release,
+    #: because the holder's remaining time dwarfs the requester's own
+    #: job size (`SIZE_DISPARITY_PREEMPTION_RATIO`) - independent of priority.
+    SIZE_DISPARITY = "SIZE_DISPARITY"
 
 
 @dataclass(frozen=True)

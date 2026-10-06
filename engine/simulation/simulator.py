@@ -52,9 +52,18 @@ class Simulator:
     snapshot                  O(1) - returns the live `SchedulerState`, never a copy
     """
 
-    def __init__(self, scenario: Scenario, speed: float = 1.0) -> None:
+    def __init__(
+        self,
+        scenario: Scenario,
+        speed: float = 1.0,
+        size_disparity_ratio: Optional[float] = None,
+    ) -> None:
         self.scenario = scenario
         self.speed = speed
+        #: Opt-in size-disparity reallocation ratio handed to every
+        #: scheduler this simulator builds (kept across `reset`).
+        #: `None` = off, the default for every scripted scenario.
+        self.size_disparity_ratio = size_disparity_ratio
         self.scheduler: Scheduler
         self.clock: SimulationClock
         self._pending_actions: List = []
@@ -70,7 +79,7 @@ class Simulator:
         gpus, users, jobs, actions = self.scenario.fresh_copies()
 
         self.clock = SimulationClock(start=self.scenario.start_time, speed=self.speed)
-        self.scheduler = Scheduler()
+        self.scheduler = Scheduler(size_disparity_ratio=self.size_disparity_ratio)
 
         for user in users:
             self.scheduler.add_user(user)

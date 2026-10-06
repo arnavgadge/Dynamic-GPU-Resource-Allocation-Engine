@@ -55,10 +55,12 @@ npm run dev
 ```
 
 Opens the dashboard on `http://localhost:5173`, talking to the
-backend on `:8000`. The scenario selector defaults to `gta5_excel`;
-pick another scenario (e.g. `idle_user`, `full_lifecycle`) and press
-**START** to watch a full allocation → reclamation → reallocation
-lifecycle happen live.
+backend on `:8000`. The server always boots into `interactive_demo`
+(10 logical GPUs at 10% utilization, users `user_a`–`user_d`), and
+the dashboard opens on it. Restarting the server resets all in-memory
+state to that scenario. To watch a scripted allocation → reclamation →
+reallocation lifecycle instead, pick another scenario from the
+selector (e.g. `idle_user`, `full_lifecycle`) and press **START**.
 
 `npm run build` produces a production build in `frontend/dist/`
 (already gitignored).
@@ -71,7 +73,7 @@ lifecycle happen live.
 python -m pytest -v
 ```
 
-Runs every unit + integration test under `tests/` — 427 tests as of
+Runs every unit + integration test under `tests/` — 751 tests as of
 this writing (`engine/`, `api/`, and their submodules), configured via
 [`pytest.ini`](../pytest.ini) (`pythonpath = .`, `testpaths = tests`).
 

@@ -140,8 +140,8 @@ npm run dev        # http://localhost:5173, talks to the backend on :8000
 ### Run the tests
 
 ```bash
-python -m pytest -v          # backend — 427 tests
-cd frontend && npm test        # frontend — component/service tests
+python -m pytest -v          # backend — 751 tests
+cd frontend && npm test        # frontend — 50 component/service tests
 ```
 
 Full setup notes (environment/config requirements, hardware
@@ -156,11 +156,14 @@ Phases 1 through 10 are complete and tested end to end:
 7. React dashboard + API adapter → 8. Hardware abstraction
 (NVML/`nvidia-smi`/simulator) → 9. Multi-user demonstration system
 (login, Admin Console, per-user Portal) → 10. Multi-GPU requests, the
-10-GPU logical pool, and resource-request/release flows.
+10-GPU logical pool, and resource-request/release flows. Final
+integration (size-disparity reallocation in the live demo, state
+consistency under long random operation sequences) is documented in
+[`docs/architecture.md`](docs/architecture.md) under Day 13.
 
-- **Backend**: 427 automated tests passing (`python -m pytest -v`).
-- **Frontend**: full component/service test suite passing
-  (`cd frontend && npm test`).
+- **Backend**: 751 automated tests passing (`python -m pytest -v`).
+- **Frontend**: 50 vitest tests passing (`cd frontend && npm test`),
+  production build succeeds (`npm run build`).
 - A further 100-scenario acceptance/validation pass and a full
   written project report were also produced — see
   `gpu_scheduler_full_report.docx` and `final_report_dsa.docx` at the

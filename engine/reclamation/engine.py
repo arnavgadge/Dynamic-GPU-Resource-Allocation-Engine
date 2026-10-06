@@ -72,6 +72,13 @@ class _ResourceRequestContext:
     #: descriptive - it only changes the `category` an event/decision
     #: trace reports, never the prompt/respond mechanics themselves.
     is_priority_preemption: bool = False
+    #: True when this ask was raised because the requester's job is
+    #: dramatically shorter than the holder's remaining time
+    #: (`SIZE_DISPARITY_PREEMPTION_RATIO`, the size-disparity
+    #: reallocation path) - independent of priority; a same-priority
+    #: requester can trigger this one. Same purely-descriptive role as
+    #: `is_priority_preemption` above - never bypasses confirmation.
+    is_size_disparity: bool = False
 
 
 @dataclass
@@ -304,7 +311,7 @@ class ReclamationEngine:
 
     def request_gpu_for_reallocation(
         self, gpu: GPU, requesting_user_id: str, requesting_user_name: str, requesting_job_id: str, now: datetime,
-        is_priority_preemption: bool = False,
+        is_priority_preemption: bool = False, is_size_disparity: bool = False,
     ) -> Optional[ReclamationDecision]:
         """Raise the *same* confirmation prompt every other reclamation
         trigger raises, but on behalf of another user's waiting job
@@ -341,6 +348,7 @@ class ReclamationEngine:
             requesting_user_name=requesting_user_name,
             requesting_job_id=requesting_job_id,
             is_priority_preemption=is_priority_preemption,
+            is_size_disparity=is_size_disparity,
         )
         gpu.status = GPUStatus.IDLE_WARNING
 
@@ -350,15 +358,30 @@ class ReclamationEngine:
                 f"{gpu.gpu_id}: {requesting_user_name}'s higher-priority request ({requesting_job_id}) "
                 f"needs a GPU - would you release this one?"
             )
+        elif is_size_disparity:
+            reason = (
+                f"{requesting_user_name}'s job ({requesting_job_id}) is far shorter than your remaining "
+                f"work on this GPU"
+            )
+            message = (
+                f"{gpu.gpu_id}: {requesting_user_name}'s request ({requesting_job_id}) is much shorter "
+                f"than your own remaining job - would you release this one?"
+            )
         else:
             reason = f"{requesting_user_name} requested this GPU for their own waiting job ({requesting_job_id})"
             message = (
                 f"{gpu.gpu_id}: {requesting_user_name} needs a GPU for {requesting_job_id} - "
                 f"would you release this one?"
             )
+        if is_priority_preemption:
+            category = EventType.PRIORITY_PREEMPTION.value
+        elif is_size_disparity:
+            category = "SIZE_DISPARITY"
+        else:
+            category = "RESOURCE_REQUEST"
         event = self._log_event(
             gpu, EventType.PROMPT, now, reason=reason, message=message,
-            metadata={"category": EventType.PRIORITY_PREEMPTION.value if is_priority_preemption else "RESOURCE_REQUEST"},
+            metadata={"category": category},
         )
         return ReclamationDecision(
             timestamp=now, gpu_id=gpu.gpu_id, tier=None,
@@ -424,7 +447,13 @@ class ReclamationEngine:
         user = self.state.get_user(user_id) if user_id else None
         previous_status = gpu.status.value
 
-        is_preemption = request_context is not None and request_context.is_priority_preemption
+        # Both priority preemption and size-disparity reallocation are
+        # "lost a scheduling contest", not "this GPU looks abandoned" -
+        # a dispossessed holder from either is requeued, never silently
+        # marked RECLAIMED (see the Day 9 reasoning below).
+        is_preemption = request_context is not None and (
+            request_context.is_priority_preemption or request_context.is_size_disparity
+        )
         requeue_needed = False
         if job is not None:
             if gpu.gpu_id in job.assigned_gpu_ids:
@@ -497,16 +526,24 @@ class ReclamationEngine:
         # every existing check for `EventType.RECLAIM` (count, filter,
         # etc.) keeps seeing exactly the events it always did.
         if request_context is not None:
-            category = (
-                EventType.PRIORITY_PREEMPTION.value if request_context.is_priority_preemption
-                else "RESOURCE_REQUEST"
-            )
-            if is_preemption:
+            if request_context.is_priority_preemption:
+                category = EventType.PRIORITY_PREEMPTION.value
+            elif request_context.is_size_disparity:
+                category = "SIZE_DISPARITY"
+            else:
+                category = "RESOURCE_REQUEST"
+            if request_context.is_priority_preemption:
                 # The affected user's own notification (Day 9) - backend
                 # state/event, never only a frontend-invented string.
                 reason = (
                     f"your GPU allocation is being reclaimed for a higher-priority scheduling "
                     f"request from {request_context.requesting_user_name} ({request_context.requesting_job_id}) "
+                    f"- {reason_suffix}"
+                )
+            elif request_context.is_size_disparity:
+                reason = (
+                    f"your GPU allocation is being reclaimed because {request_context.requesting_user_name}'s "
+                    f"job ({request_context.requesting_job_id}) is far shorter than your own remaining work "
                     f"- {reason_suffix}"
                 )
             else:

@@ -50,8 +50,10 @@ def check_consistency(scheduler: Scheduler) -> ConsistencyReport:
       gpu_count - len(assigned_gpu_ids)` (the model property, not a
       second computation - see `engine/models/job.py`).
     - A `RUNNING` job holds at least one GPU; a `WAITING` job holds
-      none; every GPU a job claims to hold actually exists and points
-      back at that job.
+      fewer than its `gpu_count` (a partially satisfied multi-GPU
+      request may hold some while still waiting for the rest); every
+      GPU a job claims to hold actually exists and points back at that
+      job.
     - `AllocationEngine`'s `UserGPUIndex` (the HashMap-backed reverse
       index) agrees with `User.assigned_gpu_ids` for every user - the
       exact class of bug Day 4/9's fixes closed for `complete_job`/
@@ -117,8 +119,13 @@ def check_consistency(scheduler: Scheduler) -> ConsistencyReport:
 
         if job.status.value == "RUNNING" and not job.assigned_gpu_ids:
             violations.append(f"{job_id}: status=RUNNING but holds no GPU")
-        if job.status.value == "WAITING" and job.assigned_gpu_ids:
-            violations.append(f"{job_id}: status=WAITING but still holds {job.assigned_gpu_ids}")
+        # A partially satisfied multi-GPU request is legitimately WAITING
+        # while it holds some GPUs (see `Job`'s docstring); it only stops
+        # being WAITING once it holds its full `gpu_count`.
+        if job.status.value == "WAITING" and len(job.assigned_gpu_ids) >= job.gpu_count:
+            violations.append(
+                f"{job_id}: status=WAITING but already holds its full {job.gpu_count} GPU(s)"
+            )
 
         if state.get_user(job.user_id) is None:
             violations.append(f"{job_id}: user_id {job.user_id!r} does not exist")

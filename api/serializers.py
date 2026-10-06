@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from api.auth import ACCOUNTS
 from api.config import ALLOWED_SPEEDS
+from api.session import IST
 from engine.allocation.config import JOB_SIZE_SIMILARITY_THRESHOLD, PRIORITY_WEIGHT, SIZE_WEIGHT
 from engine.balancing.availability import is_gpu_available
 from engine.models.enums import GPUStatus, JobStatus
@@ -119,7 +120,7 @@ def serialize_system_overview(scheduler: Scheduler, now: datetime, real_time: Op
     gpus = list(state.gpus.values())
     return {
         "simulated_time": now.isoformat(),
-        "real_time": (real_time or datetime.now(timezone.utc)).isoformat(),
+        "real_time": (real_time or datetime.now(IST)).isoformat(),
         "engine_status": state.engine_status.value,
         "total_gpus": len(gpus),
         "available_gpus": sum(1 for gpu in gpus if is_gpu_available(gpu)),
@@ -470,7 +471,7 @@ def serialize_state(
 
     return {
         "simulated_time": now.isoformat(),
-        "real_time": (real_time or datetime.now(timezone.utc)).isoformat(),
+        "real_time": (real_time or datetime.now(IST)).isoformat(),
         "uptime_seconds": uptime_seconds if uptime_seconds is not None else 0.0,
         "engine_status": state.engine_status.value,
         "gpus": [serialize_gpu(state, gpu, scheduler.reclamation_engine, now) for gpu in state.gpus.values()],

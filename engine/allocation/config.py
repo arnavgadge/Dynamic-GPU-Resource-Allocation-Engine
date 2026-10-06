@@ -56,3 +56,18 @@ assert abs((PRIORITY_WEIGHT + SIZE_WEIGHT) - 1.0) < 1e-9, (
 #: above - change them here, nowhere else.
 AGING_RATE_PER_MINUTE: float = 0.01
 AGING_MAX_CONTRIBUTION: float = 1.1
+
+#: Size-disparity reallocation (added by direct request, not part of
+#: the original brief): a waiting job may ask a *same-or-lower*
+#: priority holder to release a GPU - never forced, the exact same
+#: confirmation prompt every other reallocation trigger uses - when
+#: the holder's own remaining time is at least this many times longer
+#: than the requester's own job size. Deliberately a large ratio (a
+#: 2-minute job vs. a 60-minute one is 30x - comfortably past this),
+#: so two merely-different-sized jobs competing normally is still
+#: ordinary allocation policy (the 60/40 blended score), never this
+#: path - this only fires for a genuinely lopsided gap, not routine
+#: variation. Independent of `PRIORITY_WEIGHT`/`SIZE_WEIGHT` above:
+#: those govern who wins a GPU that's already free; this governs when
+#: it's worth *asking* for one that's busy.
+SIZE_DISPARITY_PREEMPTION_RATIO: float = 5.0

@@ -107,14 +107,13 @@ npm install
 npm run dev              # opens on http://localhost:5173, talking to the backend on :8000
 ```
 
-Then open `http://localhost:5173`. The scenario selector defaults to
-`gta5_excel`; pick `idle_user` or `full_lifecycle` from the dropdown
-and press **START** to watch the complete allocation -> reclamation
--> reallocation lifecycle happen live, exactly as `main.py` prints it
-in the terminal.
+Then open `http://localhost:5173`. The server always boots into
+`interactive_demo` (see Day 13 below). To watch a scripted lifecycle,
+pick `idle_user` or `full_lifecycle` from the dropdown and press
+**START**, exactly as `main.py` prints it in the terminal.
 
 ```
-cd frontend && npm test    # 28 frontend tests (vitest + Testing Library)
+cd frontend && npm test    # 50 frontend tests (vitest + Testing Library)
 cd frontend && npm run build  # production build check
 ```
 
@@ -1582,10 +1581,12 @@ the most recent allocation, never recomputed for display.
 
 ### 7. Interactive Demo scenario
 
-`interactive_demo` (`engine/simulation/scenarios.py`) is a blank
-4-GPU pool with the four `USER` accounts already registered and *no*
-scripted timeline - Mode 2 ("interactive users") alongside the five
-pre-existing scripted scenarios (Mode 1).
+`interactive_demo` (`engine/simulation/scenarios.py`) is a 10-GPU
+logical pool (all IDLE, 10% utilization) with users `user_a` (HIGH),
+`user_b`/`user_c` (MEDIUM) and `user_d` (LOW) registered and *no*
+scripted timeline - Mode 2 ("interactive users") alongside the
+pre-existing scripted scenarios (Mode 1). It is the only scenario
+that enables size-disparity reallocation (see Day 13 below).
 
 ### 8. Tests and results
 
@@ -1843,6 +1844,59 @@ of "now"; `/ws/events`' own `timestamp` field is each `Event`'s real,
 already-recorded timestamp (simulated time, exactly like every other
 event payload in this project) - never `datetime.now()` computed fresh
 at broadcast time.
+
+## Final Integration & Readiness (Day 13)
+
+### 1. What changed today
+
+- **Size-disparity reallocation is live for `interactive_demo`.**
+  `Simulator(scenario, speed, size_disparity_ratio=...)` now carries
+  the opt-in ratio into every scheduler it builds, including after a
+  `reset`. `SimulationSession.load_scenario` passes
+  `SIZE_DISPARITY_PREEMPTION_RATIO` (5.0) only for `interactive_demo`;
+  every scripted scenario keeps `None`, so their deterministic
+  walkthroughs and tests are unchanged. The user's worked example -
+  a 2-minute job asking a 60-minute holder - is covered end to end
+  through `SimulationSession` in `tests/api/test_live_size_disparity.py`.
+- **`check_consistency` rule corrected.** It used to flag every
+  `WAITING` job that held any GPU. That contradicted the documented
+  design: a partially satisfied multi-GPU request stays `WAITING`
+  while it holds some GPUs (see `Job`'s docstring). The rule is now
+  "a `WAITING` job holds fewer than its `gpu_count`", which still
+  catches the real bug it exists for (a fully satisfied job that
+  never transitioned to `RUNNING`).
+- **Sequence-level consistency tests.** `tests/test_state_consistency_sequences.py`
+  drives the scheduler through seeded, random mixes of 400 public
+  operations (submit, complete, cancel, reprioritise, respond,
+  force-reclaim, maintenance, failure/recovery, utilization, timeouts,
+  manual assign) and runs `assert_consistent` after every step. This
+  is the coverage the per-feature tests could not provide: features
+  agreeing with each other after many interleaved operations.
+- **Docs brought in line with the code.** Default scenario, the
+  10-GPU `interactive_demo` description, and test counts updated in
+  `README.md`, `docs/setup.md` and this file.
+
+### 2. Verified (not assumed)
+
+- Full Python suite: **751 passed** (740 before today, + 5 live
+  size-disparity tests, + 6 sequence tests).
+- Frontend: **50 passed** (vitest), `vite build` succeeds.
+- API edge cases checked through the real FastAPI app: bad
+  `gpu_count`/priority -> 422; no token -> 401; another user's job
+  cancel -> 403; cancelling a `RUNNING` job -> 409 (cancel is defined
+  only for jobs still waiting); answering a non-pending prompt -> 400;
+  a USER calling an admin route -> 403.
+
+### 3. Known limitations (carried forward, not new)
+
+- All state is in memory. A server restart returns to
+  `interactive_demo` with a fresh pool.
+- Size-disparity reallocation is opt-in and disabled in scripted
+  scenarios by design, so their recorded walkthroughs stay stable.
+- Real NVIDIA hardware was not available in this environment. The
+  NVML and `nvidia-smi` monitors are tested through injected
+  dependencies only; the 10-GPU pool is a logical scheduler concept,
+  not ten physical cards.
 
 ## What this project deliberately does NOT implement
 

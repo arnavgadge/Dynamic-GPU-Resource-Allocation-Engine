@@ -63,6 +63,7 @@ class Scheduler:
         state: Optional[SchedulerState] = None,
         reclamation_policy: ReclamationPolicy = DEFAULT_RECLAMATION_POLICY,
         balancing_policy: BalancingPolicy = DEFAULT_BALANCING_POLICY,
+        size_disparity_ratio: Optional[float] = None,
     ) -> None:
         self.state = state if state is not None else SchedulerState()
         self.allocation_engine = AllocationEngine(self.state)
@@ -71,6 +72,21 @@ class Scheduler:
             self.state, allocation_engine=self.allocation_engine, policy=reclamation_policy
         )
         self._event_seq = itertools.count(1)
+
+        #: Off (`None`) unless explicitly enabled - the size-disparity
+        #: reallocation path (`_request_additional_gpus_if_needed`'s
+        #: path 3) only ever runs when this is a real ratio. Every
+        #: scripted demo scenario (`idle_user`, `full_lifecycle`, ...)
+        #: relies on precise, pre-authored event sequences and scripted
+        #: `UserResponseAction`s answering a *specific*, expected
+        #: prompt; this path firing unexpectedly the instant any short
+        #: job waits behind any much-longer one would hijack those
+        #: scripts (a scripted "NO" meant for a Tier-1 breach prompt
+        #: would instead answer this one). Opt in per `Scheduler`
+        #: instance (`api/session.py` enables it for the live
+        #: `interactive_demo` session specifically) rather than as a
+        #: global default.
+        self.size_disparity_ratio = size_disparity_ratio
 
         # The most recent "which job" / "which GPU" decision objects,
         # for a decision-trace view (Phase 9) - purely observational,
@@ -155,6 +171,23 @@ class Scheduler:
     def _holder_priority(self, gpu: GPU) -> Priority:
         holder = self.state.get_user(gpu.assigned_user_id)
         return holder.priority if holder is not None else Priority.LOW
+
+    @staticmethod
+    def _remaining_minutes(job: Job, now: datetime) -> float:
+        """How much longer ``job`` (a RUNNING job) is estimated to run,
+        in minutes - `job.started_at + estimated_size_minutes`, clamped
+        to never go negative. `None` if ``job`` hasn't started (should
+        not happen for a GPU's current holder, but never assumed).
+        Used only by the size-disparity reallocation path below; this
+        is not a new "remaining time" concept elsewhere in the project
+        - `check_estimated_completions` already reasons about the same
+        `started_at + estimated_size_minutes` deadline, just to decide
+        *whether* it has passed rather than *how much* is left.
+        """
+        if job.started_at is None:
+            return 0.0
+        remaining = (job.started_at + timedelta(minutes=job.estimated_size_minutes) - now).total_seconds() / 60.0
+        return max(remaining, 0.0)
 
     def _eligible_candidate(self, gpu: GPU, job: Job, now: datetime) -> bool:
         """Shared guard for both reallocation paths below: never a GPU
@@ -253,6 +286,23 @@ class Scheduler:
            project; "immediately preempt" never means bypassing
            confirmation (that is what `Scheduler.force_reclaim`,
            Phase 8, is for).
+
+        3. **Size-disparity reallocation** - a waiting job of *any*
+           `gpu_count`, including 1, whose own job size is at least
+           `SIZE_DISPARITY_PREEMPTION_RATIO` times shorter than a
+           holder's *remaining* estimated time may ask that holder to
+           release, regardless of priority tier (same-or-lower priority
+           included - this is deliberately independent of path 2's
+           priority gate). Added on direct request: a 2-minute job
+           waiting behind someone else's 60-minute job is exactly the
+           lopsided case this exists for, without turning ordinary
+           allocation into pure SJF - the 60/40 blended score still
+           decides every *ordinary* "who gets a free GPU" question
+           untouched; this only decides when it's worth *asking* for a
+           busy one. Same consent-based mechanics as every other path:
+           the holder's real YES/NO (or silence past the grace period)
+           decides, and a NO leaves the requester exactly where it
+           was - still WAITING, nothing forced.
 
         What happens to a GPU freed either way - who actually receives
         it - is decided the next time `try_allocate_all` runs, by the
@@ -412,6 +462,88 @@ class Scheduler:
                 reason=f"{job.job_id} ({requester_priority.name}) needs {remaining_deficit} more GPU(s); "
                        f"asked {len(preempted_ids)} genuinely lower-priority holder(s)",
             ))
+
+            # -- path 3: size-disparity reallocation (any gpu_count, any priority) --
+            #
+            # Opt-in only (`self.size_disparity_ratio`, None = off) -
+            # see the constructor's own comment for why this must never
+            # be a silent global default. Independent of priority tier
+            # on purpose (unlike path 2): this fires purely because the
+            # holder's remaining time so dwarfs the requester's own job
+            # that asking is reasonable regardless of who outranks whom.
+            # The ratio gate keeps this from firing on routine size
+            # differences - only a genuinely lopsided gap qualifies, so
+            # the 60/40 blended score still governs every *ordinary*
+            # allocation decision untouched.
+            size_ratio = self.size_disparity_ratio
+            already_asked = asked_gpu_ids | preempted_ids
+            requester_size = job.estimated_size_minutes
+
+            def _size_disparity_eligible(gpu: GPU) -> bool:
+                if requester_size <= 0 or not self._eligible_candidate(gpu, job, now):
+                    return False
+                holder_job = self.state.get_job(gpu.assigned_job_id) if gpu.assigned_job_id else None
+                if holder_job is None:
+                    return False
+                holder_remaining = self._remaining_minutes(holder_job, now)
+                return holder_remaining >= size_ratio * requester_size
+
+            def _size_disparity_skip_reason(gpu: GPU) -> Optional[str]:
+                holder_job = self.state.get_job(gpu.assigned_job_id) if gpu.assigned_job_id else None
+                if holder_job is None:
+                    return "no running job on this GPU"
+                holder_remaining = self._remaining_minutes(holder_job, now)
+                if requester_size <= 0 or holder_remaining < size_ratio * requester_size:
+                    return f"holder's remaining time is not {size_ratio:g}x the requester's job size"
+                return None
+
+            remaining_after_preemption = remaining_deficit - len(preempted_ids)
+            if size_ratio is not None and remaining_after_preemption > 0:
+                disparity_candidates = [
+                    gpu for gpu in self.state.gpus.values()
+                    if gpu.gpu_id not in already_asked and _size_disparity_eligible(gpu)
+                ]
+                disparity_candidates.sort(
+                    key=lambda gpu: (-self._remaining_minutes(self.state.get_job(gpu.assigned_job_id), now), gpu.gpu_id)
+                )
+                disparity_ids: set = set()
+                for gpu in disparity_candidates[:remaining_after_preemption]:
+                    holder_job = self.state.get_job(gpu.assigned_job_id)
+                    holder_label = self._label_for_holder(gpu)
+                    holder_remaining = self._remaining_minutes(holder_job, now)
+                    self._log_event(
+                        EventType.REQUEST, now, gpu_id=gpu.gpu_id, user_id=job.user_id, job_id=job.job_id,
+                        message=(
+                            f"{requester_label} needs a GPU for {job.job_id} ({requester_size:g} min); "
+                            f"{gpu.gpu_id} is held by {holder_label} with ~{holder_remaining:.0f} min "
+                            f"remaining - requesting release due to the size gap"
+                        ),
+                        reason=f"no free/underutilized/higher-priority candidate available; "
+                               f"{gpu.gpu_id}'s holder has {size_ratio:g}x+ the "
+                               f"requester's remaining work",
+                        metadata={"category": "SIZE_DISPARITY"},
+                    )
+                    decision = self.reclamation_engine.request_gpu_for_reallocation(
+                        gpu, requesting_user_id=job.user_id, requesting_user_name=requester_label,
+                        requesting_job_id=job.job_id, now=now, is_size_disparity=True,
+                    )
+                    if decision is not None:
+                        self.last_resource_request_decision = decision
+                    disparity_ids.add(gpu.gpu_id)
+
+                self.last_balancing_traces.append(LoadBalancingTrace(
+                    timestamp=now, job_id=job.job_id, path=ReallocationPath.SIZE_DISPARITY,
+                    deficit=remaining_after_preemption,
+                    candidates=[
+                        c for c in self._load_balancing_candidates(
+                            job, now, ReallocationPath.SIZE_DISPARITY, disparity_ids, _size_disparity_skip_reason,
+                        )
+                        if c.gpu_id not in already_asked
+                    ],
+                    selected_gpu_ids=sorted(disparity_ids),
+                    reason=f"{job.job_id} ({requester_size:g} min) needs {remaining_after_preemption} more "
+                           f"GPU(s); asked {len(disparity_ids)} holder(s) with disproportionately longer jobs",
+                ))
 
     def _label_for_holder(self, gpu: GPU) -> str:
         holder = self.state.get_user(gpu.assigned_user_id)

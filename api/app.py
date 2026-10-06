@@ -51,7 +51,14 @@ from api.serializers import (
 from api.session import SimulationSession
 from engine.simulation import load_default_registry
 
-DEFAULT_SCENARIO_ID = "gta5_excel"
+#: The scenario a fresh server process boots into - every restart (a
+#: `--reload` code change, a crash, a manual stop/start) loses all
+#: in-memory state (this project has no persistence layer) and starts
+#: here again. `interactive_demo` - the 10-GPU pool with User A-D
+#: already registered - not one of the small scripted walkthroughs, so
+#: a restart during live testing never silently drops you back into a
+#: 2-GPU scenario with different (non-portal) users.
+DEFAULT_SCENARIO_ID = "interactive_demo"
 
 
 class ConnectionManager:

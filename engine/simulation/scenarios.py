@@ -366,8 +366,21 @@ def build_interactive_demo() -> Scenario:
     then manually establishes whatever initial arrangement a
     demonstration needs (`SimulationSession.manual_assign_gpu`) rather
     than one being hardcoded here.
+
+    Each starts at a fixed, cosmetic 10% utilization reading rather
+    than the `GPU` model's own 0% default - a blank dashboard full of
+    0%-everywhere GPUs reads as "broken telemetry" rather than "idle
+    and free" for this specific demo. This is a *starting* value only,
+    scoped to this one scenario (the `GPU` model's own default, and
+    every other scenario, are unchanged) - any real reading fed in
+    later via `Scheduler.record_utilization` (a scripted action, the
+    hardware poller, or an admin test) overwrites it exactly as
+    normal; nothing here pins it at 10% going forward.
     """
-    gpus = [GPU(gpu_id=f"GPU-{i}", total_memory_mb=24_576, status=GPUStatus.IDLE) for i in range(1, 11)]
+    gpus = [
+        GPU(gpu_id=f"GPU-{i}", total_memory_mb=24_576, status=GPUStatus.IDLE, utilization_percent=10.0)
+        for i in range(1, 11)
+    ]
     users = [
         User(user_id="user_a", name="User A", priority=Priority.HIGH),
         User(user_id="user_b", name="User B", priority=Priority.MEDIUM),

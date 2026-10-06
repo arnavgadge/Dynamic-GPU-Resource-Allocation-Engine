@@ -13,6 +13,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+#: India Standard Time - UTC+5:30, no daylight saving. Display-only
+#: (`current_real_time` below): the engine's own scheduling decisions
+#: never read this - they run entirely on `Simulator.clock` (simulated
+#: time), exactly as before. This only changes what timezone the real
+#: wall-clock is *shown* in (the header clock, `/api/clock`,
+#: `real_time` on every state/system payload).
+IST = timezone(timedelta(hours=5, minutes=30))
+
 from api.config import (
     ALLOWED_SPEEDS,
     BACKGROUND_TICK,
@@ -21,6 +29,7 @@ from api.config import (
     MAX_USER_GPU_REQUEST,
     MIN_USER_GPU_REQUEST,
 )
+from engine.allocation.config import SIZE_DISPARITY_PREEMPTION_RATIO
 from engine.hardware.factory import detect_gpu_monitor
 from engine.hardware.monitor import GPUMonitor, MonitorUnavailableError
 from engine.hardware.poller import MonitorPoller
@@ -146,7 +155,12 @@ class SimulationSession:
         that to an HTTP 404 rather than inventing a new error shape.
         """
         scenario = self.registry.load(scenario_id)
-        self.simulator = Simulator(scenario, speed=self.speed)
+        # Size-disparity reallocation is switched on only for the live
+        # interactive demo (the user's requested behaviour). Scripted
+        # scenarios stay on the default `None` so their tests and
+        # deterministic walkthroughs are unchanged.
+        ratio = SIZE_DISPARITY_PREEMPTION_RATIO if scenario_id == "interactive_demo" else None
+        self.simulator = Simulator(scenario, speed=self.speed, size_disparity_ratio=ratio)
         self.scenario_id = scenario_id
         self.scenario_name = scenario.name
         self.running = False
@@ -181,9 +195,11 @@ class SimulationSession:
 
     @staticmethod
     def current_real_time() -> datetime:
-        """The actual system clock, right now - never the simulated
-        clock, never a frontend-invented value."""
-        return datetime.now(timezone.utc)
+        """The actual system clock, right now, in IST - never the
+        simulated clock (`Simulator.clock`, what every scheduling
+        decision actually runs on - untouched by this), and never a
+        frontend-invented value."""
+        return datetime.now(IST)
 
     def start(self) -> None:
         self.running = True
